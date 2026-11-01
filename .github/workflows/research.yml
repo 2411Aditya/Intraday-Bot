@@ -1,0 +1,91 @@
+name: Market Research Automation
+
+# STATUS: HELD — schedule is commented out until connectivity test passes and is approved.
+# To activate: remove the '# HELD:' prefixes from the schedule block below.
+
+on:
+  # HELD: schedule:
+  #   # 1. Overnight global research (23:00 IST = 17:30 UTC, Mon-Fri)
+  #   - cron: '30 17 * * 1-5'
+  #   # 2. Pre-market screening & watchlist (08:30 IST = 03:00 UTC, Mon-Fri)
+  #   - cron: '0 3 * * 1-5'
+  #   # 3. Post-market analysis (16:00 IST = 10:30 UTC, Mon-Fri)
+  #   - cron: '30 10 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      session:
+        description: 'Research session type'
+        required: true
+        default: 'pre_market'
+        type: choice
+        options:
+          - overnight
+          - pre_market
+          - post_market
+      force:
+        description: 'Force execution even on holidays/weekends'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: research-automation
+  cancel-in-progress: false
+
+jobs:
+  run-research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install yfinance requests smartapi-python pyotp logzero websocket-client
+
+      - name: Determine Session Type
+        id: session_calc
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "session=${{ github.event.inputs.session }}" >> $GITHUB_OUTPUT
+            echo "force=${{ github.event.inputs.force }}" >> $GITHUB_OUTPUT
+          else
+            # Derive session from UTC hour
+            HOUR=$(date -u +%H)
+            if [ "$HOUR" -ge 17 ]; then
+              echo "session=overnight" >> $GITHUB_OUTPUT
+            elif [ "$HOUR" -ge 10 ]; then
+              echo "session=post_market" >> $GITHUB_OUTPUT
+            else
+              echo "session=pre_market" >> $GITHUB_OUTPUT
+            fi
+            echo "force=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Execute Research Engine
+        env:
+          ANGELONE_API_KEY: ${{ secrets.ANGELONE_API_KEY }}
+          ANGELONE_CLIENT_ID: ${{ secrets.ANGELONE_CLIENT_ID }}
+          ANGELONE_PASSWORD: ${{ secrets.ANGELONE_PASSWORD }}
+          ANGELONE_TOTP_SECRET: ${{ secrets.ANGELONE_TOTP_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TRADING_MODE: 'paper'
+          LIVE_TRADING_ENABLED: 'false'
+        run: |
+          EXTRA_FLAGS=""
+          if [ "${{ steps.session_calc.outputs.force }}" = "true" ]; then
+            EXTRA_FLAGS="--force"
+          fi
+          python research/run_research.py --session "${{ steps.session_calc.outputs.session }}" $EXTRA_FLAGS
+

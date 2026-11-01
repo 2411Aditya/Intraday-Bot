@@ -1,0 +1,59 @@
+name: Scheduled Paper Trading
+
+# STATUS: HELD — schedule is commented out until connectivity test passes and is approved.
+# To activate: remove the '# HELD:' prefixes from the schedule block below.
+
+on:
+  # HELD: schedule:
+  #   # Every 15 minutes during NSE market hours (09:15 - 15:30 IST = 03:45 - 10:00 UTC, Mon-Fri)
+  #   - cron: '*/15 3-10 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      force_session:
+        description: 'Bypass market hours check for testing'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: paper-trading-worker
+  cancel-in-progress: false
+
+jobs:
+  trade-cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install smartapi-python pyotp logzero websocket-client yfinance requests
+
+      - name: Run Intraday Worker Cycle
+        env:
+          ANGELONE_API_KEY: ${{ secrets.ANGELONE_API_KEY }}
+          ANGELONE_CLIENT_ID: ${{ secrets.ANGELONE_CLIENT_ID }}
+          ANGELONE_PASSWORD: ${{ secrets.ANGELONE_PASSWORD }}
+          ANGELONE_TOTP_SECRET: ${{ secrets.ANGELONE_TOTP_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TRADING_MODE: 'paper'
+          LIVE_TRADING_ENABLED: 'false'
+        run: |
+          EXTRA_FLAGS=""
+          if [ "${{ github.event.inputs.force_session }}" = "true" ]; then
+            EXTRA_FLAGS="--force-session"
+          fi
+          python -m backend.app.worker --run-once $EXTRA_FLAGS
+

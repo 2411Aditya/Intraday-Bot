@@ -1,0 +1,41 @@
+name: Angel One SmartAPI Connectivity Test
+
+# STATUS: MANUAL TRIGGER ONLY — no cron, no push trigger.
+# Run this first to confirm GitHub-runner → SmartAPI connectivity before enabling scheduled workflows.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  connectivity-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install smartapi-python pyotp logzero websocket-client
+
+      - name: Run SmartAPI Connectivity Test
+        env:
+          ANGELONE_API_KEY: ${{ secrets.ANGELONE_API_KEY }}
+          ANGELONE_CLIENT_ID: ${{ secrets.ANGELONE_CLIENT_ID }}
+          ANGELONE_PASSWORD: ${{ secrets.ANGELONE_PASSWORD }}
+          ANGELONE_TOTP_SECRET: ${{ secrets.ANGELONE_TOTP_SECRET }}
+          TRADING_MODE: 'paper'
+          LIVE_TRADING_ENABLED: 'false'
+        # No SUPABASE_* secrets — this test does NOT write to any database.
+        run: |
+          python backend/tests/connectivity_test_angelone.py
+
