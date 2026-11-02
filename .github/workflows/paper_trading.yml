@@ -1,12 +1,18 @@
 name: Scheduled Paper Trading
 
-# STATUS: HELD — schedule is commented out until connectivity test passes and is approved.
+# STATUS: HELD — schedule is commented out until launch is approved.
 # To activate: remove the '# HELD:' prefixes from the schedule block below.
+#
+# Cron explanation (GitHub Actions uses UTC):
+#   NSE market hours: 09:15 – 15:30 IST  =  03:45 – 10:00 UTC
+#   Every 5 minutes:  */5 3-10 * * 1-5
+#   NOTE: The cron bracket 3-10 means hours 03–10 UTC.
+#         First fire at 03:45 UTC (09:15 IST), last possible fire at 10:00 UTC (15:30 IST).
+#         The worker enforces IST boundaries internally and exits cleanly if the session is closed.
 
 on:
   # HELD: schedule:
-  #   # Every 15 minutes during NSE market hours (09:15 - 15:30 IST = 03:45 - 10:00 UTC, Mon-Fri)
-  #   - cron: '*/15 3-10 * * 1-5'
+  #   - cron: '*/5 3-10 * * 1-5'
   workflow_dispatch:
     inputs:
       force_session:
@@ -17,12 +23,13 @@ on:
 
 concurrency:
   group: paper-trading-worker
+  # false: never cancel an active trading cycle. A new trigger queues behind the running one.
   cancel-in-progress: false
 
 jobs:
   trade-cycle:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -58,11 +65,13 @@ jobs:
           python -m backend.app.worker --run-once $EXTRA_FLAGS
 
       # Emergency square-off safety cycle.
-      # If the regular 15-min cron is delayed past 15:15 IST (09:45 UTC), positions
-      # could be carried past intraday close. This step runs an additional forced cycle
-      # after the main run — the worker's own 15:15 IST logic will square off all open
-      # positions at the current LTP. Idempotent: already-closed positions are skipped.
-      - name: Emergency Square-Off Safety Cycle (post-15:15 IST only)
+      # Purpose: if the main cycle runs after 15:15 IST, open positions are square-off
+      #          by the worker's own IST time check. This step runs unconditionally
+      #          whenever the UTC time is >= 09:45 (= 15:15 IST) — no upper bound, so
+      #          a cron delayed past 16:00 IST still triggers square-off.
+      # Safety: the worker's close_position() is idempotent — already-closed positions
+      #         are skipped. Realistic slippage and fees are applied even on forced exits.
+      - name: Emergency Square-Off Safety Cycle (>= 15:15 IST)
         env:
           ANGELONE_API_KEY: ${{ secrets.ANGELONE_API_KEY }}
           ANGELONE_CLIENT_ID: ${{ secrets.ANGELONE_CLIENT_ID }}
@@ -74,16 +83,15 @@ jobs:
           TRADING_MODE: 'paper'
           LIVE_TRADING_ENABLED: 'false'
         run: |
-          # Only run if current UTC time >= 09:45 (= 15:15 IST) — square-off window
+          # Run only if UTC >= 09:45 (= 15:15 IST). No upper bound: a late cron still
+          # forces square-off. New entries are blocked by the worker's session check.
           HOUR=$(date -u +%H)
           MIN=$(date -u +%M)
           TOTAL_MINS=$((HOUR * 60 + MIN))
           SQUAREOFF_MINS=$((9 * 60 + 45))   # 09:45 UTC = 15:15 IST
-          CLOSE_MINS=$((10 * 60 + 30))       # 10:30 UTC = 16:00 IST (do not run after market close)
-          if [ "$TOTAL_MINS" -ge "$SQUAREOFF_MINS" ] && [ "$TOTAL_MINS" -le "$CLOSE_MINS" ]; then
-            echo "Post-15:15 IST detected — running emergency square-off cycle"
+          if [ "$TOTAL_MINS" -ge "$SQUAREOFF_MINS" ]; then
+            echo "Post-15:15 IST (UTC ${HOUR}:${MIN}) — running emergency square-off cycle"
             python -m backend.app.worker --run-once --force-session
           else
             echo "Pre-square-off window (UTC ${HOUR}:${MIN}). Emergency cycle skipped."
           fi
-

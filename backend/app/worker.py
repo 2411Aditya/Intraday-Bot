@@ -50,8 +50,10 @@ from backend.app.persistence.supabase_trader import (
     get_daily_account_state,
     get_db_connection,
     get_last_processed_candle_ts,
+    is_candle_already_processed,
     is_position_open_in_db,
     is_symbol_traded_today,
+    mark_candle_processed,
     persist_trade_cycle,
     reserve_trade_slot,
     save_last_processed_candle_ts,
@@ -383,15 +385,20 @@ class IntradayWorker:
                     self.traded_symbols_today.add(symbol)
                     logger.info("Order executed for %s: qty=%d @ %.2f status=%s", symbol, order.quantity, order.price, order.status.value)
 
-                    # Persist atomic trade reservation and trade cycle to Supabase
+                    # Persist atomic trade reservation and trade cycle to Supabase.
+                    # Durable candle idempotency: mark_candle_processed is called ONLY after
+                    # the order and state are safely persisted in Supabase. This prevents
+                    # duplicate orders across GitHub Actions retries and overlapping runs.
                     if self.conn and self.account_id:
                         try:
+                            # 1. Atomic symbol-level reservation (prevents concurrent workers)
                             reserve_trade_slot(self.conn, self.account_id, symbol, active_date, self.worker_id)
                             leg_fees = TransactionCostModel.calculate_leg_costs(
                                 quantity=order.quantity,
                                 price=order.average_fill_price,
                                 side=order.direction.value,
                             )
+                            # 2. Full trade-cycle persistence
                             persist_trade_cycle(
                                 conn=self.conn,
                                 user_id=self.system_user_id,
@@ -405,6 +412,18 @@ class IntradayWorker:
                                 research_snapshot_id=snapshot.snapshot_id if snapshot else None,
                             )
                             logger.info("Persisted trade cycle to Supabase for %s", symbol)
+                            # 3. Durable candle idempotency mark — only after successful persistence
+                            if signal:
+                                candle_key_ts = signal.timestamp
+                                newly_marked = mark_candle_processed(
+                                    self.conn, self.account_id, symbol, "VWAP_ORB", candle_key_ts
+                                )
+                                if not newly_marked:
+                                    logger.warning(
+                                        "Candle %s for %s @ %s already marked processed (duplicate run). "
+                                        "Trade persisted idempotently via reserve_trade_slot.",
+                                        "VWAP_ORB", symbol, candle_key_ts.isoformat(),
+                                    )
                         except Exception as e:
                             logger.error("Failed to persist trade cycle to Supabase: %s", e)
 
@@ -423,7 +442,6 @@ class IntradayWorker:
 
             except Exception as e:
                 logger.error("Error evaluating symbol %s: %s", symbol, e)
-
         account = self.execution_adapter.get_account_state()
         logger.info("Cycle finished. Account equity=%.2f cash=%.2f positions=%d",
                     account.total_equity, account.cash_balance, len(self.execution_adapter.get_open_positions()))

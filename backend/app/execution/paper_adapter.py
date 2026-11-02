@@ -127,25 +127,22 @@ class PaperExecutionAdapter(ExecutionAdapter):
     def close_position(
         self, position_id: str, exit_price: float, reason: str = "TARGET_OR_STOP"
     ) -> Position:
-        """Closes an active position, applies exit slippage, and updates ledger with statutory costs."""
+        """Closes an active position, applies exit slippage, and updates ledger with statutory costs.
+
+        Slippage is applied uniformly for all exit reasons including INTRADAY_SQUARE_OFF,
+        preserving realistic paper execution costs as required.
+        """
         pos = self.positions.get(position_id)
         if not pos or pos.status != PositionStatus.OPEN:
             raise ValueError(f"Position {position_id} is not open.")
 
-        # Model exit slippage
+        # Model exit slippage — applied uniformly including INTRADAY_SQUARE_OFF
         slippage_amount = round(exit_price * self.slippage_rate, 2)
         if pos.direction == SignalDirection.BUY:
-            # Skip slippage for forced square‑off to reflect exact market price
-            if reason == "INTRADAY_SQUARE_OFF":
-                actual_exit = round(exit_price, 2)
-            else:
-                actual_exit = round(exit_price - slippage_amount, 2)  # Adverse exit on sell
+            actual_exit = round(exit_price - slippage_amount, 2)  # Adverse exit on sell
             gross_pnl = round((actual_exit - pos.entry_price) * pos.quantity, 2)
         else:
-            if reason == "INTRADAY_SQUARE_OFF":
-                actual_exit = round(exit_price, 2)
-            else:
-                actual_exit = round(exit_price + slippage_amount, 2)  # Adverse exit on buy-to-cover
+            actual_exit = round(exit_price + slippage_amount, 2)  # Adverse exit on buy-to-cover
             gross_pnl = round((pos.entry_price - actual_exit) * pos.quantity, 2)
 
         # Calculate exit leg fees and total trade statutory fees
@@ -220,4 +217,3 @@ class PaperExecutionAdapter(ExecutionAdapter):
 
 def order_id_suffix(val: str) -> str:
     return val[-6:] if len(val) >= 6 else "000001"
-

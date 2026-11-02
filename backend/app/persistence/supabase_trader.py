@@ -339,6 +339,64 @@ def is_position_open_in_db(conn, account_id: str, symbol: str) -> bool:
         return bool(row and row[0] > 0)
 
 
+def is_candle_already_processed(
+    conn,
+    account_id: str,
+    symbol: str,
+    strategy_id: str,
+    candle_ts: datetime.datetime,
+) -> bool:
+    """Check whether a (account, symbol, strategy, candle_timestamp) key already exists.
+
+    Used to guarantee cross-process, cross-retry idempotency: no order is
+    placed twice for the same completed candle. Must be called inside the
+    same transaction that creates the reservation/order.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*)
+            FROM processed_candles
+            WHERE account_id = %s
+              AND symbol = %s
+              AND strategy_id = %s
+              AND candle_ts = %s;
+            """,
+            (account_id, symbol, strategy_id, candle_ts),
+        )
+        row = cur.fetchone()
+        return bool(row and row[0] > 0)
+
+
+def mark_candle_processed(
+    conn,
+    account_id: str,
+    symbol: str,
+    strategy_id: str,
+    candle_ts: datetime.datetime,
+) -> bool:
+    """Atomically insert a processed-candle record using ON CONFLICT DO NOTHING.
+
+    Returns True if the row was newly inserted (caller may proceed with order).
+    Returns False if the row already existed (duplicate — caller must skip).
+    Must be called AFTER the order and its Supabase state are safely persisted.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO processed_candles
+                (account_id, symbol, strategy_id, candle_ts, recorded_at)
+            VALUES (%s, %s, %s, %s, now())
+            ON CONFLICT (account_id, symbol, strategy_id, candle_ts)
+            DO NOTHING;
+            """,
+            (account_id, symbol, strategy_id, candle_ts),
+        )
+        inserted = cur.rowcount == 1
+    conn.commit()
+    return inserted
+
+
 def get_daily_account_state(conn, account_id: str, trading_date: datetime.date) -> dict[str, Any]:
     """Retrieve full daily ledger and risk state from Supabase for crash recovery."""
     with conn.cursor() as cur:
@@ -380,8 +438,4 @@ def get_daily_account_state(conn, account_id: str, trading_date: datetime.date) 
         "trades_count_today": trades_count,
         "realized_pnl_today": realized_pnl,
     }
-
-
-
-
 

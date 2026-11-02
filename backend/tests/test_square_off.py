@@ -61,6 +61,10 @@ def test_compulsory_square_off_at_1515_ist():
     assert closed_pos.position_id == "pos-1"
     # Reason must be INTRADAY_SQUARE_OFF
     assert closed_pos.exit_reason == "INTRADAY_SQUARE_OFF"
-    # Exit price should be the current quote supplied
-    assert closed_pos.exit_price == 100.0
+    # Exit price includes adverse slippage (BUY position exits at quote - slippage)
+    # Default slippage_rate=0.0005, quote=100.0 → actual_exit = 100.0 - 0.05 = 99.95
+    expected_exit = round(100.0 - round(100.0 * 0.0005, 2), 2)  # 99.95
+    assert closed_pos.exit_price == expected_exit, (
+        f"Expected exit_price={expected_exit} (quote minus slippage), got {closed_pos.exit_price}"
+    )
 

@@ -40,6 +40,9 @@ class TradingEngine:
         self.execution = execution_adapter
         self.audit = logger_instance or audit_logger
         self.mode = mode
+        # Track processed candles to ensure idempotency across retries / overlapping runs
+        self._processed_candles: set[tuple[str, str, str]] = set()  # (symbol, candle_timestamp_iso, strategy_id)
+
 
     def process_symbol(
         self,
@@ -112,6 +115,12 @@ class TradingEngine:
             if not signal:
                 continue
 
+            # Idempotency check: skip if this candle+strategy already processed
+            candle_key = (symbol, current_bar.timestamp.isoformat(), "VWAP_ORB")
+            if candle_key in self._processed_candles:
+                logger.debug("Skipping duplicate processing for %s @ %s", symbol, current_bar.timestamp)
+                continue
+
             latest_signal = signal
             self.audit.log_signal(signal, self.mode)
 
@@ -144,6 +153,8 @@ class TradingEngine:
             order = self.execution.submit_order(risk_decision.order_intent)
             self.audit.log_order(order)
             executed_order = order
+            # Record processed candle to avoid duplicate orders on retries
+            self._processed_candles.add(candle_key)
             break  # Executed trade for this symbol; stop processing further bars
 
         return latest_signal, executed_order
