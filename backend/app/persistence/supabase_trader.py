@@ -178,6 +178,13 @@ def save_last_processed_candle_ts(
     signal_id: str | None = None,
 ) -> None:
     """Persists or updates the last processed candle timestamp for idempotency and resume."""
+    sig_uuid = None
+    if signal_id:
+        try:
+            sig_uuid = str(uuid.UUID(signal_id))
+        except (ValueError, AttributeError):
+            sig_uuid = None
+
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -189,7 +196,7 @@ def save_last_processed_candle_ts(
                 last_evaluated_signal_id = EXCLUDED.last_evaluated_signal_id,
                 updated_at = now();
             """,
-            (symbol, trading_date, candle_ts, signal_id),
+            (symbol, trading_date, candle_ts, sig_uuid),
         )
     conn.commit()
 
@@ -251,6 +258,48 @@ def reserve_trade_slot(
         row = cur.fetchone()
     conn.commit()
     return bool(row and row[0])
+
+
+def get_account_ledger(conn, account_id: str) -> dict[str, float]:
+    """Retrieve authoritative account ledger values (cash_balance, deployed_margin) from Supabase."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT cash_balance, deployed_margin FROM trading_accounts WHERE id = %s;",
+            (account_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            return {
+                "cash_balance": float(row[0]),
+                "deployed_margin": float(row[1]),
+            }
+        return {}
+
+
+def get_open_positions_from_db(conn, account_id: str) -> list[dict[str, Any]]:
+    """Retrieve all open positions for an account from Supabase."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, symbol, direction, quantity, avg_entry_price
+            FROM positions
+            WHERE account_id = %s AND status = 'open' AND quantity > 0
+            ORDER BY open_timestamp DESC;
+            """,
+            (account_id,),
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "id": str(r[0]),
+                "symbol": r[1],
+                "direction": r[2],
+                "quantity": int(r[3]),
+                "avg_entry_price": float(r[4]),
+            }
+            for r in rows
+        ]
+
 
 
 

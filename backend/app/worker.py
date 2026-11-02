@@ -73,7 +73,7 @@ IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 class IntradayWorker:
     """Portable Intraday Trading Worker."""
 
-    def __init__(self, mode: TradingMode = TradingMode.PAPER, use_mock: bool = False):
+    def __init__(self, mode: TradingMode = TradingMode.PAPER, use_mock: bool = False, user_id: str | None = None):
         self.mode = mode
         self.use_mock = use_mock
 
@@ -105,7 +105,7 @@ class IntradayWorker:
         # Database connection for state tracking and persistent idempotency
         self.conn = None
         self.account_id = None
-        self.system_user_id = os.getenv("BOT_USER_ID", "00000000-0000-0000-0000-000000000001")
+        self.system_user_id = user_id or os.getenv("BOT_USER_ID", "00000000-0000-0000-0000-000000000001")
         try:
             self.conn = get_db_connection()
             self.account_id = ensure_trading_account(
@@ -115,11 +115,54 @@ class IntradayWorker:
                 starting_capital=settings.VIRTUAL_STARTING_CAPITAL,
             )
             logger.info("Connected to Supabase. Account ID: %s", self.account_id)
+            self._sync_state_from_db()
         except Exception as e:
             logger.warning("Supabase connection not initialized for worker: %s", e)
 
         # Idempotency cache: tracks symbols traded today (in-memory fast cache backed by DB)
         self.traded_symbols_today: set[str] = set()
+
+    def _sync_state_from_db(self) -> None:
+        """Syncs account balance and open positions from Supabase on startup/restart."""
+        if not self.conn or not self.account_id:
+            return
+        try:
+            from backend.app.persistence.supabase_trader import get_account_ledger, get_open_positions_from_db
+            ledger = get_account_ledger(self.conn, self.account_id)
+            if ledger and ledger.get("cash_balance") is not None:
+                db_cash = ledger["cash_balance"]
+                db_deployed = ledger.get("deployed_margin", 0.0)
+                # Only sync if account has activity in Supabase
+                if db_cash > 0 and (db_cash != settings.VIRTUAL_STARTING_CAPITAL or db_deployed > 0):
+                    self.execution_adapter.account.cash_balance = db_cash
+                    self.execution_adapter.account.deployed_margin = db_deployed
+                    logger.info("Restored ledger from Supabase: cash=%.2f deployed=%.2f", db_cash, db_deployed)
+
+            # Restore open positions
+            open_db_positions = get_open_positions_from_db(self.conn, self.account_id)
+            for db_p in open_db_positions:
+                sym = db_p["symbol"]
+                if sym not in [p.symbol for p in self.execution_adapter.get_open_positions()]:
+                    from backend.app.models.domain import Position, PositionStatus, SignalDirection
+                    dir_enum = SignalDirection.BUY if db_p["direction"].lower() in ("long", "buy") else SignalDirection.SELL
+                    stop_loss = db_p["avg_entry_price"] * (0.98 if dir_enum == SignalDirection.BUY else 1.02)
+                    target = db_p["avg_entry_price"] * (1.04 if dir_enum == SignalDirection.BUY else 0.96)
+                    restored_pos = Position(
+                        order_id=db_p.get("order_id", f"restored-{uuid.uuid4().hex[:6]}"),
+                        symbol=sym,
+                        direction=dir_enum,
+                        quantity=db_p["quantity"],
+                        entry_price=db_p["avg_entry_price"],
+                        current_price=db_p["avg_entry_price"],
+                        stop_loss=stop_loss,
+                        target=target,
+                        status=PositionStatus.OPEN,
+                        mode=self.mode,
+                    )
+                    self.execution_adapter.positions[restored_pos.position_id] = restored_pos
+                    logger.info("Restored open position from Supabase for %s (qty=%d @ %.2f)", sym, restored_pos.quantity, restored_pos.entry_price)
+        except Exception as e:
+            logger.warning("Could not sync state from Supabase: %s", e)
 
     def get_market_session_status(self, now: datetime.datetime) -> tuple[bool, str]:
         """Check if currently within regular NSE trading hours (09:15 - 15:30 IST)."""
@@ -140,9 +183,9 @@ class IntradayWorker:
 
         return True, "Market is OPEN"
 
-    def run_cycle(self, session_date: datetime.date | None = None) -> dict:
+    def run_cycle(self, session_date: datetime.date | None = None, current_time: datetime.datetime | None = None) -> dict:
         """Run a single evaluation cycle across candidate stocks."""
-        now_ist = datetime.datetime.now(IST)
+        now_ist = current_time.astimezone(IST) if current_time else datetime.datetime.now(IST)
         active_date = session_date or now_ist.date()
 
         logger.info("--- Starting Intraday Evaluation Cycle (date=%s, time=%s IST) ---", active_date, now_ist.strftime("%H:%M:%S"))
@@ -227,6 +270,31 @@ class IntradayWorker:
         cycle_results["closed_positions"] = len(closed)
         if closed:
             logger.info("Closed %d positions during cycle", len(closed))
+            if self.conn and self.account_id:
+                for c_pos in closed:
+                    try:
+                        from backend.app.models.domain import SignalDirection
+                        exit_direction = "sell" if c_pos.direction == SignalDirection.BUY else "buy"
+                        exit_fees = TransactionCostModel.calculate_leg_costs(
+                            quantity=c_pos.quantity,
+                            price=c_pos.exit_price,
+                            side=exit_direction.upper(),
+                        )
+                        persist_trade_cycle(
+                            conn=self.conn,
+                            user_id=self.system_user_id,
+                            account_id=self.account_id,
+                            symbol=c_pos.symbol,
+                            direction=exit_direction,
+                            signal_price=c_pos.exit_price,
+                            fill_price=c_pos.exit_price,
+                            quantity=c_pos.quantity,
+                            fees=exit_fees,
+                            research_snapshot_id=snapshot.snapshot_id if snapshot else None,
+                        )
+                        logger.info("Persisted exit trade cycle to Supabase for %s", c_pos.symbol)
+                    except Exception as e:
+                        logger.error("Failed to persist exit trade cycle to Supabase: %s", e)
 
         # 4. Evaluate candidates for entries
         for symbol in allowed_symbols:
@@ -259,6 +327,7 @@ class IntradayWorker:
                     start=session_start,
                     end=session_end,
                     last_processed_ts=last_ts,
+                    current_execution_time=current_time,
                 )
                 if signal:
                     cycle_results["signals"] += 1
