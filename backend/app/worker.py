@@ -283,6 +283,16 @@ class IntradayWorker:
             cycle_results["reason"] = "MISSING_RESEARCH_SNAPSHOT"
             return cycle_results
 
+        # Reject non-pre_market snapshots — overnight/post_market research cannot authorize trades
+        if snapshot.session_type != "pre_market":
+            logger.warning(
+                "Research snapshot %s is session_type=%s, not pre_market. Suspending new entries.",
+                snapshot.snapshot_id, snapshot.session_type,
+            )
+            cycle_results["status"] = "SUSPENDED"
+            cycle_results["reason"] = "PRE_MARKET_SNAPSHOT_REQUIRED"
+            return cycle_results
+
         # Research gating policy for new entries
         allowed_symbols: list[str] = []
         fresh = is_snapshot_fresh(snapshot)

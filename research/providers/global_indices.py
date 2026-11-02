@@ -18,12 +18,13 @@ from research.models import DataStatus, ProviderResult
 logger = logging.getLogger("research.global_indices")
 
 TICKERS = {
-    "SP500":   "^GSPC",
-    "NASDAQ":  "^IXIC",
-    "NIKKEI":  "^N225",
-    "HANGSENG":"^HSI",
-    "KOSPI":   "^KS11",
-    "ASX200":  "^AXJO",
+    "SP500":    "^GSPC",
+    "NASDAQ":   "^IXIC",
+    "DOW":      "^DJI",
+    "NIKKEI":   "^N225",
+    "HANGSENG": "^HSI",
+    "KOSPI":    "^KS11",
+    "ASX200":   "^AXJO",
 }
 
 

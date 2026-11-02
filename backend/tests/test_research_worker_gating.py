@@ -213,6 +213,60 @@ class TestResearchWorkerGating(unittest.TestCase):
         self.assertEqual(result.get("status"), "SUSPENDED", f"Got: {result}")
         self.assertEqual(result.get("reason"), "EMPTY_WATCHLIST", f"Got: {result}")
 
+    # 9 --- overnight snapshot cannot directly authorize trading
+    def test_overnight_snapshot_cannot_authorize_trades(self):
+        snap = _make_snapshot(
+            trading_date=str(self.today),
+            age_hours=0.5,
+            market_outlook="BULLISH",
+            watchlist=[{"symbol": "SBIN"}],
+        )
+        snap.session_type = "overnight"
+        result = _run_worker_cycle(snap, self.today)
+        self.assertEqual(result.get("status"), "SUSPENDED", f"Got: {result}")
+        self.assertEqual(result.get("reason"), "PRE_MARKET_SNAPSHOT_REQUIRED", f"Got: {result}")
+
+    # 10 --- overnight research feeds into pre_market research engine
+    def test_overnight_research_feeds_into_premarket_engine(self):
+        from research.engine import ResearchEngine
+        from research.models import ProviderResult, DataStatus
+
+        overnight_snap = ResearchSnapshot(
+            snapshot_id="RS-TEST-OVERNIGHT",
+            session_type="overnight",
+            trading_date=str(self.today),
+            market_outlook="HIGH_RISK",
+            risk_warnings=["SP500 fell -2.1% overnight — caution"],
+            is_tradeable_session=True,
+        )
+
+        mock_provider_ok = ProviderResult(
+            source="mock",
+            fetched_at=datetime.datetime.now(UTC),
+            status=DataStatus.OK,
+            data={},
+        )
+
+        with patch("research.persistence.load_latest_snapshot", return_value=overnight_snap), \
+             patch("research.providers.global_indices.fetch", return_value=mock_provider_ok), \
+             patch("research.providers.fx_commodities.fetch", return_value=mock_provider_ok), \
+             patch("research.providers.fii_dii.fetch", return_value=mock_provider_ok), \
+             patch("research.providers.nse_announcements.fetch", return_value=mock_provider_ok), \
+             patch("research.providers.economic_events.fetch", return_value=mock_provider_ok), \
+             patch("research.providers.gift_nifty.fetch", return_value=mock_provider_ok), \
+             patch("research.providers.sector_strength.fetch", return_value=mock_provider_ok):
+            engine = ResearchEngine()
+            snap = engine.run(session_type="pre_market")
+            # Verify overnight warning carried into premarket
+            self.assertTrue(
+                any("Overnight outlook was HIGH_RISK" in w for w in snap.risk_warnings),
+                f"Expected overnight warning in {snap.risk_warnings}",
+            )
+            self.assertTrue(
+                any("[Overnight]" in w for w in snap.risk_warnings),
+                f"Expected [Overnight] prefix in {snap.risk_warnings}",
+            )
+
 
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)

@@ -55,7 +55,10 @@ def main():
 
     ist = zoneinfo.ZoneInfo("Asia/Kolkata")
     now_ist = datetime.datetime.now(ist)
-    trading_date = now_ist.strftime("%Y-%m-%d")
+    if args.session == "overnight" and now_ist.hour >= 20:
+        trading_date = (now_ist.date() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    else:
+        trading_date = now_ist.strftime("%Y-%m-%d")
 
     logger.info("Starting research job session=%s trading_date=%s IST=%s", args.session, trading_date, now_ist.isoformat())
 

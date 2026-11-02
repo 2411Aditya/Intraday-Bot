@@ -9,6 +9,8 @@ on:
     - cron: '0 3 * * 1-5'
     # 2. Post-market analysis (16:00 IST = 10:30 UTC, Mon-Fri)
     - cron: '30 10 * * 1-5'
+    # 3. Overnight global research (23:00 IST = 17:30 UTC, Sun-Thu for Mon-Fri sessions)
+    - cron: '30 17 * * 0-4'
   workflow_dispatch:
     inputs:
       session:

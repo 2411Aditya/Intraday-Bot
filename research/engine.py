@@ -83,6 +83,16 @@ def _derive_outlook(
         elif chg < -0.5:
             bear_signals += 1
 
+    dow = global_data.get("DOW", {})
+    if dow.get("status") == DataStatus.OK:
+        chg = dow.get("change_pct", 0.0)
+        if chg > 0.5:
+            bull_signals += 1
+        elif chg < -0.5:
+            bear_signals += 1
+            if chg < -1.5:
+                warnings.append(f"Dow Jones fell {chg}% overnight — caution")
+
     # 2. GIFT Nifty
     if gift_data.get("status") == DataStatus.OK:
         pass  # premium/discount analysis could be added later
@@ -105,15 +115,18 @@ def _derive_outlook(
             bear_signals += 1
             warnings.append(f"Crude +{chg}% — inflation / CAD risk")
 
-    # 5. VIX
-    vix = fx_data.get("CBOE_VIX", {})
+    # 5. VIX (Prefer India VIX if available, fallback to CBOE VIX)
+    india_vix = fx_data.get("INDIA_VIX", {})
+    cboe_vix = fx_data.get("CBOE_VIX", {})
+    vix = india_vix if india_vix.get("status") == DataStatus.OK else cboe_vix
+    vix_name = "India VIX" if india_vix.get("status") == DataStatus.OK else "CBOE VIX"
     if vix.get("status") == DataStatus.OK:
         vix_val = vix.get("close", 0.0)
         if vix_val > 25:
             bear_signals += 2
-            warnings.append(f"CBOE VIX={vix_val} — elevated volatility, reduce position size")
+            warnings.append(f"{vix_name}={vix_val} — elevated volatility, reduce position size")
         elif vix_val > 20:
-            warnings.append(f"CBOE VIX={vix_val} — moderate volatility")
+            warnings.append(f"{vix_name}={vix_val} — moderate volatility")
 
     # 6. FII flows
     fii_net = fii_data.get("fii_net_buy_sell")
@@ -168,7 +181,13 @@ class ResearchEngine:
 
     def run(self, session_type: str = "pre_market") -> ResearchSnapshot:
         ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-        trading_date = datetime.datetime.now(ist).strftime("%Y-%m-%d")
+        now_ist = datetime.datetime.now(ist)
+        # When overnight runs in the evening (>= 20:00 IST), its analysis targets the next trading day
+        if session_type == "overnight" and now_ist.hour >= 20:
+            trading_date = (now_ist.date() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            trading_date = now_ist.strftime("%Y-%m-%d")
+
         is_trading, no_trade_reason = _is_trading_day(trading_date)
 
         logger.info("ResearchEngine.run session=%s date=%s tradeable=%s", session_type, trading_date, is_trading)
@@ -203,6 +222,28 @@ class ResearchEngine:
             sector_data=sec_result.data,
             gift_data=gift_result.data,
         )
+
+        # Feed prior overnight research into pre-market intelligence if available
+        if session_type == "pre_market":
+            try:
+                from research.persistence import load_latest_snapshot
+                overnight_snap = load_latest_snapshot("overnight", trading_date=trading_date)
+                if not overnight_snap:
+                    # Also check overnight snapshot from the previous calendar day
+                    prev_date = (datetime.date.fromisoformat(trading_date) - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                    overnight_snap = load_latest_snapshot("overnight", trading_date=prev_date)
+                if overnight_snap:
+                    logger.info("Feeding overnight snapshot %s (outlook=%s) into pre-market analysis",
+                                overnight_snap.snapshot_id, overnight_snap.market_outlook)
+                    if overnight_snap.market_outlook == "HIGH_RISK" and outlook != "HIGH_RISK":
+                        risk_warnings.append(f"Overnight outlook was HIGH_RISK: {'; '.join(overnight_snap.risk_warnings[:2])}")
+                    for w in overnight_snap.risk_warnings:
+                        if any(kw in w.lower() for kw in ("caution", "crash", "sell-off", "volatility", "pressure")):
+                            prefixed = f"[Overnight] {w}"
+                            if prefixed not in risk_warnings:
+                                risk_warnings.append(prefixed)
+            except Exception as e:
+                logger.warning("Could not check/load prior overnight snapshot: %s", e)
 
         if not is_trading:
             risk_warnings.insert(0, f"NO_TRADE: {no_trade_reason}")
