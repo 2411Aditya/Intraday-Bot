@@ -36,3 +36,4 @@ export async function pingSupabase(): Promise<{ ok: boolean; latencyMs: number; 
     return { ok: false, latencyMs, error: err?.message || 'Network error' };
   }
 }
+

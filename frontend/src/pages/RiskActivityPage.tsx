@@ -84,7 +84,7 @@ export const RiskActivityPage: React.FC = () => {
         <StatCard
           title="Risk Per Trade"
           value={formatINR(RISK_LIMITS.riskPerTradeINR)}
-          subValue="1.0% max capital risk per entry"
+          subValue={`${RISK_LIMITS.riskPerTradePct}% max capital risk per entry`}
           icon={Lock}
         />
 
@@ -92,7 +92,7 @@ export const RiskActivityPage: React.FC = () => {
         <StatCard
           title="Daily Trades Limit"
           value={`${todayTradesCount} / ${RISK_LIMITS.maxDailyTrades}`}
-          subValue="Enforces max 3 entries per session"
+          subValue={`Enforces max ${RISK_LIMITS.maxDailyTrades} entries per session`}
           icon={Activity}
           trend={todayTradesCount >= RISK_LIMITS.maxDailyTrades ? 'down' : 'neutral'}
         />
@@ -335,3 +335,4 @@ export const RiskActivityPage: React.FC = () => {
     </div>
   );
 };
+

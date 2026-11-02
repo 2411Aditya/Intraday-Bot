@@ -490,3 +490,4 @@ export const TradingPage: React.FC = () => {
     </div>
   );
 };
+

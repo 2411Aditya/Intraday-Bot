@@ -30,7 +30,19 @@ export function useTradingAccount(): UseTradingAccountResult {
     setLoading(true);
     setError(null);
     try {
-      // 1. Fetch Trading Account
+      // Guard: ensure user is authenticated before fetching private data
+  const user = supabase.auth.user();
+  if (!user) {
+    // Not logged in: clear data and stop loading
+    setAccount(null);
+    setLatestSnapshot(null);
+    setWorkerState(null);
+    setLoading(false);
+    setError(null);
+    return;
+  }
+
+  // 1. Fetch Trading Account
       const { data: acctData, error: acctErr } = await supabase
         .from('trading_accounts')
         .select('*')
@@ -98,3 +110,4 @@ export function useTradingAccount(): UseTradingAccountResult {
     totalPnL,
   };
 }
+

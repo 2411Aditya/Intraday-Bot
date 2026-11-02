@@ -13,3 +13,4 @@ export const LoadingSkeleton: React.FC<{ rows?: number; height?: string; classNa
     </div>
   );
 };
+

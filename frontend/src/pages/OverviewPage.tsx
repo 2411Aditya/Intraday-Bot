@@ -31,7 +31,7 @@ import {
   getMarketSessionStatus,
   timeAgo,
 } from '../lib/formatters';
-import { STARTING_CAPITAL_INR } from '../lib/constants';
+import { STARTING_CAPITAL_INR, RISK_LIMITS } from '../lib/constants';
 
 export const OverviewPage: React.FC = () => {
   const {
@@ -137,7 +137,7 @@ export const OverviewPage: React.FC = () => {
         <StatCard
           title="Open Positions"
           value={openPositions.length}
-          subValue={`Today's Trades: ${todayTradesCount} / 3 max`}
+          subValue={`Today's Trades: ${todayTradesCount} / ${RISK_LIMITS.maxDailyTrades} max`}
           icon={Activity}
           badge={
             openPositions.length > 0 ? (
@@ -390,3 +390,4 @@ export const OverviewPage: React.FC = () => {
     </div>
   );
 };
+

@@ -8,13 +8,15 @@ export const STARTING_CAPITAL_INR = 10000.0;
 
 export const RISK_LIMITS = {
   startingCapital: STARTING_CAPITAL_INR,
-  dailyLossLimitPct: 3.0, // 3% of capital = ₹300 max daily loss
-  dailyLossLimitINR: 300.0,
-  riskPerTradePct: 1.0,   // 1% of capital = ₹100 max risk per trade
-  riskPerTradeINR: 100.0,
-  maxDailyTrades: 3,
-  maxOpenPositions: 1,
+  dailyLossLimitPct: 1.0, // 1% of capital = ₹100 max daily loss
+  dailyLossLimitINR: 100.0,
+  riskPerTradePct: 0.5,   // 0.5% of capital = ₹50 max risk per trade
+  riskPerTradeINR: 50.0,
+  maxDailyTrades: 2,      // Max 2 entries per session
+  maxOpenPositions: 1,    // 1 concurrent position max
   minRiskRewardRatio: 1.5,
+  targetRiskRewardRatio: 2.0, // 1:2 default R:R
+  entryWindowIST: '09:30–11:30 IST',
   entryCutoffIST: '14:45 IST',
   compulsorySquareOffIST: '15:15 IST',
   marketCloseIST: '15:30 IST',
@@ -58,3 +60,4 @@ export const NAV_ITEMS = [
   { path: '/risk', label: 'Risk & Activity', icon: 'ShieldAlert' },
   { path: '/settings', label: 'Settings', icon: 'Settings' },
 ];
+

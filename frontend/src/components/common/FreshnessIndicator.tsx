@@ -45,3 +45,4 @@ export const FreshnessIndicator: React.FC<FreshnessIndicatorProps> = ({
     </div>
   );
 };
+

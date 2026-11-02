@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { supabase, TARGET_ACCOUNT_ID } from '../lib/supabase';
 import type { AccountSnapshot, Position, OrderFill } from '../types';
-import { STARTING_CAPITAL_INR } from '../lib/constants';
+import { STARTING_CAPITAL_INR, RISK_LIMITS } from '../lib/constants';
 
 export interface SymbolStat {
   symbol: string;
@@ -84,9 +84,9 @@ export function useAnalytics() {
   const avgWin = wins.length > 0 ? totalWinAmount / wins.length : null;
   const avgLoss = losses.length > 0 ? totalLossAmount / losses.length : null;
 
-  // Realized R-Multiple (assuming 1R = ₹100 / 1% risk per trade)
+  // Realized R-Multiple (1R = 0.5% risk per trade = ₹50)
   const avgRMultiple = closedCount > 0
-    ? positions.reduce((sum, p) => sum + (Number(p.realized_pnl) / 100), 0) / closedCount
+    ? positions.reduce((sum, p) => sum + (Number(p.realized_pnl) / RISK_LIMITS.riskPerTradeINR), 0) / closedCount
     : null;
 
   // Trading costs
@@ -159,3 +159,4 @@ export function useAnalytics() {
     refetch: fetchAnalyticsData,
   };
 }
+

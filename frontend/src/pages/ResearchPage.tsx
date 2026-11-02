@@ -419,3 +419,4 @@ export const ResearchPage: React.FC = () => {
     </div>
   );
 };
+
