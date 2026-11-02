@@ -16,7 +16,9 @@ import psycopg2
 
 logger = logging.getLogger("SupabaseTrader")
 
-PROD_BOT_USER_ID = "00000000-0000-0000-0000-000000000001"
+PROD_BOT_USER_ID = "00000000-0000-0000-0000-000000000002"
+HISTORICAL_PROD_USER_ID = "00000000-0000-0000-0000-000000000001"
+PROD_BOT_USER_IDS = {PROD_BOT_USER_ID, HISTORICAL_PROD_USER_ID}
 
 
 def is_test_environment() -> bool:
@@ -31,9 +33,9 @@ def is_test_environment() -> bool:
 def assert_test_isolation(user_id: str | None = None) -> None:
     """Fails closed if a test attempts to modify the production paper account."""
     if is_test_environment():
-        if user_id == PROD_BOT_USER_ID:
+        if user_id in PROD_BOT_USER_IDS:
             raise RuntimeError(
-                f"Test isolation violation: Test runner attempted to modify production account user {PROD_BOT_USER_ID}. "
+                f"Test isolation violation: Test runner attempted to modify production account user {user_id}. "
                 "Integration tests must use isolated ephemeral test accounts."
             )
 

@@ -11,8 +11,10 @@ name: Scheduled Paper Trading
 #         The worker enforces IST boundaries internally and exits cleanly if the session is closed.
 
 on:
-  # HELD: schedule:
-  #   - cron: '*/5 3-10 * * 1-5'
+  schedule:
+    # Every 5 minutes during NSE market hours (09:15 - 15:30 IST = 03:45 - 10:00 UTC, Mon-Fri)
+    # The worker enforces IST session boundaries internally (09:15-15:30) and exits cleanly outside hours.
+    - cron: '*/5 3-10 * * 1-5'
   workflow_dispatch:
     inputs:
       force_session:
@@ -55,6 +57,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          BOT_USER_ID: '00000000-0000-0000-0000-000000000002'
           TRADING_MODE: 'paper'
           LIVE_TRADING_ENABLED: 'false'
         run: |
@@ -80,6 +83,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          BOT_USER_ID: '00000000-0000-0000-0000-000000000002'
           TRADING_MODE: 'paper'
           LIVE_TRADING_ENABLED: 'false'
         run: |

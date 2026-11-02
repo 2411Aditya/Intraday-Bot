@@ -4,13 +4,11 @@ name: Market Research Automation
 # To activate: remove the '# HELD:' prefixes from the schedule block below.
 
 on:
-  # HELD: schedule:
-  #   # 1. Overnight global research (23:00 IST = 17:30 UTC, Mon-Fri)
-  #   - cron: '30 17 * * 1-5'
-  #   # 2. Pre-market screening & watchlist (08:30 IST = 03:00 UTC, Mon-Fri)
-  #   - cron: '0 3 * * 1-5'
-  #   # 3. Post-market analysis (16:00 IST = 10:30 UTC, Mon-Fri)
-  #   - cron: '30 10 * * 1-5'
+  schedule:
+    # 1. Pre-market screening & watchlist (08:30 IST = 03:00 UTC, Mon-Fri)
+    - cron: '0 3 * * 1-5'
+    # 2. Post-market analysis (16:00 IST = 10:30 UTC, Mon-Fri)
+    - cron: '30 10 * * 1-5'
   workflow_dispatch:
     inputs:
       session:

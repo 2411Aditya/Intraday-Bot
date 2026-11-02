@@ -109,7 +109,7 @@ class IntradayWorker:
         # Database connection for state tracking and persistent idempotency
         self.conn = None
         self.account_id = None
-        self.system_user_id = user_id or os.getenv("BOT_USER_ID", "00000000-0000-0000-0000-000000000001")
+        self.system_user_id = user_id or os.getenv("BOT_USER_ID", "00000000-0000-0000-0000-000000000002")
         try:
             self.conn = get_db_connection()
             self.account_id = ensure_trading_account(
