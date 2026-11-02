@@ -105,6 +105,7 @@ def fetch() -> ProviderResult:
                     fetched_at=fetched_at,
                     status=DataStatus.OK,
                     data={
+                        "status": DataStatus.OK,
                         "exchange": exchange,
                         "symbol": symbol,
                         "token": token,

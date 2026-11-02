@@ -129,12 +129,16 @@ def _derive_outlook(
             pass
 
     # Final outlook
-    if bear_signals >= 3:
-        return "BEARISH", warnings
-    if bull_signals >= 3:
-        return "BULLISH", warnings
+    # HIGH_RISK: Elevated downside pressure (>=2 bear signals) or conflicting macro crosswinds
+    if bear_signals >= 2 and bull_signals >= 2:
+        warnings.append(f"Conflicting macro signals (bull={bull_signals}, bear={bear_signals}) — high volatility risk")
+        return "HIGH_RISK", warnings
     if bear_signals >= 2:
         return "HIGH_RISK", warnings
+    if bull_signals >= 3:
+        return "BULLISH", warnings
+    if bear_signals == 1 and bull_signals == 0:
+        return "NEUTRAL", warnings
     return "NEUTRAL", warnings
 
 
