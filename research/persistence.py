@@ -35,6 +35,17 @@ def _get_conn():
 
 def save_snapshot(snapshot: ResearchSnapshot) -> None:
     """Persist a ResearchSnapshot to Supabase research_snapshots table."""
+    is_test_env = bool(
+        os.getenv("PYTEST_CURRENT_TEST")
+        or os.getenv("ENV") == "test"
+        or os.getenv("APP_ENV") == "test"
+    )
+    if is_test_env and snapshot.session_type != "test":
+        raise RuntimeError(
+            f"Test isolation violation: Test runner attempted to persist snapshot with session_type='{snapshot.session_type}'. "
+            "Tests must mock persistence or use session_type='test' to prevent production research contamination."
+        )
+
     snapshot_json = snapshot.model_dump_json()
     sql = """
         INSERT INTO research_snapshots
@@ -63,9 +74,21 @@ def save_snapshot(snapshot: ResearchSnapshot) -> None:
         conn.close()
 
 
-def load_latest_snapshot(session_type: str | None = None) -> ResearchSnapshot | None:
+def load_latest_snapshot(
+    session_type: str | None = None,
+    trading_date: datetime.date | str | None = None,
+) -> ResearchSnapshot | None:
     """Return the most recent ResearchSnapshot from Supabase, or None if none exist."""
-    where = "WHERE session_type = %s" if session_type else ""
+    conditions = []
+    params = []
+    if session_type:
+        conditions.append("session_type = %s")
+        params.append(session_type)
+    if trading_date:
+        conditions.append("trading_date = %s")
+        params.append(str(trading_date))
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     sql = f"""
         SELECT snapshot_json FROM research_snapshots
         {where}
@@ -75,8 +98,8 @@ def load_latest_snapshot(session_type: str | None = None) -> ResearchSnapshot | 
     conn = _get_conn()
     try:
         with conn, conn.cursor() as cur:
-            if session_type:
-                cur.execute(sql, (session_type,))
+            if params:
+                cur.execute(sql, tuple(params))
             else:
                 cur.execute(sql)
             row = cur.fetchone()

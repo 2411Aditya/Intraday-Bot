@@ -140,13 +140,11 @@ class TestResearchWorkerGating(unittest.TestCase):
         self.assertEqual(result.get("status"), "SUSPENDED", f"Got: {result}")
         self.assertEqual(result.get("reason"), "STALE_SNAPSHOT", f"Got: {result}")
 
-    # 3 --- missing snapshot falls back to default universe
-    def test_missing_snapshot_uses_default_universe(self):
+    # 3 --- missing snapshot suspends trading
+    def test_missing_snapshot_suspends_trading(self):
         result = _run_worker_cycle(None, self.today)
-        self.assertNotIn(result.get("status"), ("SUSPENDED", "SKIPPED"),
-                         f"Should use default fallback, got: {result}")
-        self.assertEqual(result.get("evaluated"), 5,
-                         "Default universe should be 5 symbols")
+        self.assertEqual(result.get("status"), "SUSPENDED", f"Got: {result}")
+        self.assertEqual(result.get("reason"), "MISSING_RESEARCH_SNAPSHOT", f"Got: {result}")
 
     # 4 --- HIGH_RISK suspends new entries
     def test_high_risk_snapshot_suspends_entries(self):

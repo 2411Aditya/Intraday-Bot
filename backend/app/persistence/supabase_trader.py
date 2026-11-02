@@ -16,6 +16,27 @@ import psycopg2
 
 logger = logging.getLogger("SupabaseTrader")
 
+PROD_BOT_USER_ID = "00000000-0000-0000-0000-000000000001"
+
+
+def is_test_environment() -> bool:
+    """Return True if executing within a test runner or test environment."""
+    return bool(
+        os.getenv("PYTEST_CURRENT_TEST")
+        or os.getenv("ENV") == "test"
+        or os.getenv("APP_ENV") == "test"
+    )
+
+
+def assert_test_isolation(user_id: str | None = None) -> None:
+    """Fails closed if a test attempts to modify the production paper account."""
+    if is_test_environment():
+        if user_id == PROD_BOT_USER_ID:
+            raise RuntimeError(
+                f"Test isolation violation: Test runner attempted to modify production account user {PROD_BOT_USER_ID}. "
+                "Integration tests must use isolated ephemeral test accounts."
+            )
+
 
 def get_db_connection():
     """Return an active psycopg2 connection to SUPABASE_DB_URL."""
@@ -28,6 +49,7 @@ def get_db_connection():
 
 def ensure_trading_account(conn, user_id: str, mode: str = "paper", starting_capital: float = 10000.0) -> str:
     """Ensure a trading account exists for the user and return its UUID."""
+    assert_test_isolation(user_id)
     with conn.cursor() as cur:
         cur.execute(
             "SELECT id FROM trading_accounts WHERE user_id = %s AND mode = %s;",
@@ -67,6 +89,7 @@ def persist_trade_cycle(
     fill_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute full transactional trade persistence into Supabase using pg_execute_trade_cycle."""
+    assert_test_isolation(user_id)
     sig_uuid = signal_id or str(uuid.uuid4())
     risk_uuid = risk_id or str(uuid.uuid4())
     intent_uuid = intent_id or str(uuid.uuid4())

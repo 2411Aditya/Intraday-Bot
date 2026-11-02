@@ -19,6 +19,7 @@ from __future__ import annotations
 import datetime
 import os
 import unittest
+from unittest.mock import patch
 import uuid
 import zoneinfo
 from pathlib import Path
@@ -72,7 +73,20 @@ class TestPaperOrderLifecycle(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if cls.conn:
-            cls.conn.close()
+            try:
+                with cls.conn.cursor() as cur:
+                    cur.execute("DELETE FROM order_fills WHERE order_id IN (SELECT id FROM orders WHERE account_id = %s);", (cls.account_id,))
+                    cur.execute("DELETE FROM orders WHERE account_id = %s;", (cls.account_id,))
+                    cur.execute("DELETE FROM order_intents WHERE account_id = %s;", (cls.account_id,))
+                    cur.execute("DELETE FROM positions WHERE account_id = %s;", (cls.account_id,))
+                    cur.execute("DELETE FROM trade_reservations WHERE account_id = %s;", (cls.account_id,))
+                    cur.execute("DELETE FROM risk_decisions WHERE account_id = %s;", (cls.account_id,))
+                    cur.execute("DELETE FROM trading_accounts WHERE id = %s;", (cls.account_id,))
+                cls.conn.commit()
+            except Exception:
+                pass
+            finally:
+                cls.conn.close()
 
     def test_complete_paper_order_lifecycle(self):
         # -------------------------------------------------------------
@@ -89,7 +103,6 @@ class TestPaperOrderLifecycle(unittest.TestCase):
             allowed_symbols=[symbol, "SBIN", "RELIANCE"],
             watchlist=[{"symbol": symbol, "score": 1.5, "change_pct_1d": 1.5}],
         )
-        save_snapshot(snap)
 
         # -------------------------------------------------------------
         # STEP 1: Signal Generation (VWAP + ORB Breakout on deterministic candles)
@@ -288,7 +301,6 @@ class TestPaperOrderLifecycle(unittest.TestCase):
             allowed_symbols=[symbol],
             watchlist=[{"symbol": symbol, "score": 2.0, "change_pct_1d": 2.0}],
         )
-        save_snapshot(snap)
 
         # 2. Setup mock market data with synthetic breakout candles
         candles = MockMarketDataProvider.generate_synthetic_session(
@@ -309,48 +321,60 @@ class TestPaperOrderLifecycle(unittest.TestCase):
             volume=candles[-1].volume,
         ))
 
-        # 3. Cycle 1: Entry execution
-        entry_time = datetime.datetime.combine(active_date, datetime.time(9, 36), tzinfo=IST)
-        res1 = worker.run_cycle(session_date=active_date, current_time=entry_time)
-        self.assertEqual(res1["orders"], 1, "Must execute 1 paper order on breakout")
-        self.assertEqual(len(worker.execution_adapter.get_open_positions()), 1)
-        open_pos = worker.execution_adapter.get_open_positions()[0]
+        try:
+            with patch("backend.app.worker.load_latest_snapshot", return_value=snap):
+                # 3. Cycle 1: Entry execution
+                entry_time = datetime.datetime.combine(active_date, datetime.time(9, 36), tzinfo=IST)
+                res1 = worker.run_cycle(session_date=active_date, current_time=entry_time)
+                self.assertEqual(res1["orders"], 1, "Must execute 1 paper order on breakout")
+                self.assertEqual(len(worker.execution_adapter.get_open_positions()), 1)
+                open_pos = worker.execution_adapter.get_open_positions()[0]
 
-        # Supabase entry ledger check
-        ledger1 = get_account_ledger(self.conn, test_acct_id)
-        self.assertAlmostEqual(
-            worker.execution_adapter.account.cash_balance,
-            ledger1["cash_balance"],
-            places=2,
-            msg="Entry cash must match Supabase ledger exactly",
-        )
+                # Supabase entry ledger check
+                ledger1 = get_account_ledger(self.conn, test_acct_id)
+                self.assertAlmostEqual(
+                    worker.execution_adapter.account.cash_balance,
+                    ledger1["cash_balance"],
+                    places=2,
+                    msg="Entry cash must match Supabase ledger exactly",
+                )
 
-        # 4. Cycle 2: Target hit exit
-        target_price = open_pos.target
-        worker.market_data.set_quote(symbol, MarketTick(
-            symbol=symbol,
-            ltp=target_price,
-            bid=target_price - 0.05,
-            ask=target_price + 0.05,
-            volume=50000,
-        ))
+                # 4. Cycle 2: Target hit exit
+                target_price = open_pos.target
+                worker.market_data.set_quote(symbol, MarketTick(
+                    symbol=symbol,
+                    ltp=target_price,
+                    bid=target_price - 0.05,
+                    ask=target_price + 0.05,
+                    volume=50000,
+                ))
 
-        exit_time = datetime.datetime.combine(active_date, datetime.time(10, 0), tzinfo=IST)
-        res2 = worker.run_cycle(session_date=active_date, current_time=exit_time)
-        self.assertEqual(res2["closed_positions"], 1, "Must close 1 position when target reached")
-        self.assertEqual(res2["orders"], 0, "Idempotency must prevent new entries for same symbol")
-        self.assertEqual(len(worker.execution_adapter.get_open_positions()), 0)
+                exit_time = datetime.datetime.combine(active_date, datetime.time(10, 0), tzinfo=IST)
+                res2 = worker.run_cycle(session_date=active_date, current_time=exit_time)
+                self.assertEqual(res2["closed_positions"], 1, "Must close 1 position when target reached")
+                self.assertEqual(res2["orders"], 0, "Idempotency must prevent new entries for same symbol")
+                self.assertEqual(len(worker.execution_adapter.get_open_positions()), 0)
 
-        # Supabase exit reconciliation
-        ledger2 = get_account_ledger(self.conn, test_acct_id)
-        self.assertAlmostEqual(
-            worker.execution_adapter.account.cash_balance,
-            ledger2["cash_balance"],
-            places=2,
-            msg="Exit cash must match Supabase ledger exactly to ₹0.00 discrepancy",
-        )
-        self.assertTrue(ledger2["cash_balance"] > 100_000.0, "Target hit profit must increase net cash above starting capital")
-        self.assertEqual(ledger2["deployed_margin"], 0.0, "Deployed margin must be 0 after position close")
+                # Supabase exit reconciliation
+                ledger2 = get_account_ledger(self.conn, test_acct_id)
+                self.assertAlmostEqual(
+                    worker.execution_adapter.account.cash_balance,
+                    ledger2["cash_balance"],
+                    places=2,
+                    msg="Exit cash must match Supabase ledger exactly to ₹0.00 discrepancy",
+                )
+                self.assertTrue(ledger2["cash_balance"] > 100_000.0, "Target hit profit must increase net cash above starting capital")
+                self.assertEqual(ledger2["deployed_margin"], 0.0, "Deployed margin must be 0 after position close")
+        finally:
+            with self.conn.cursor() as cur:
+                cur.execute("DELETE FROM order_fills WHERE order_id IN (SELECT id FROM orders WHERE account_id = %s);", (test_acct_id,))
+                cur.execute("DELETE FROM orders WHERE account_id = %s;", (test_acct_id,))
+                cur.execute("DELETE FROM order_intents WHERE account_id = %s;", (test_acct_id,))
+                cur.execute("DELETE FROM positions WHERE account_id = %s;", (test_acct_id,))
+                cur.execute("DELETE FROM trade_reservations WHERE account_id = %s;", (test_acct_id,))
+                cur.execute("DELETE FROM risk_decisions WHERE account_id = %s;", (test_acct_id,))
+                cur.execute("DELETE FROM trading_accounts WHERE id = %s;", (test_acct_id,))
+            self.conn.commit()
 
 
 if __name__ == "__main__":

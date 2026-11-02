@@ -264,69 +264,75 @@ class IntradayWorker:
                         self.execution_adapter.revert_position_to_open(c_pos.position_id)
                         cycle_results["closed_positions"] -= 1
 
-        # 2. Check research snapshot for new trade entries
+        # 2. Check research snapshot for new trade entries (strictly scoped to active_date)
         snapshot: ResearchSnapshot | None = None
         try:
-            snapshot = load_latest_snapshot("pre_market") or load_latest_snapshot()
+            snapshot = (
+                load_latest_snapshot("pre_market", trading_date=active_date)
+                or load_latest_snapshot(trading_date=active_date)
+            )
         except Exception as e:
             logger.warning("Could not query research snapshot from DB: %s", e)
 
+        # Reject missing research snapshots — only trade on active_date research
+        if not snapshot:
+            logger.warning("No research snapshot available for session date %s. Suspending new entries.", active_date)
+            cycle_results["status"] = "SUSPENDED"
+            cycle_results["reason"] = "MISSING_RESEARCH_SNAPSHOT"
+            return cycle_results
+
         # Research gating policy for new entries
         allowed_symbols: list[str] = []
-        if snapshot:
-            fresh = is_snapshot_fresh(snapshot)
-            date_match = (snapshot.trading_date == str(active_date))
-            logger.info(
-                "Found snapshot id=%s outlook=%s fresh=%s date_match=%s tradeable=%s",
-                snapshot.snapshot_id, snapshot.market_outlook, fresh, date_match, snapshot.is_tradeable_session,
+        fresh = is_snapshot_fresh(snapshot)
+        date_match = (snapshot.trading_date == str(active_date))
+        logger.info(
+            "Found snapshot id=%s outlook=%s fresh=%s date_match=%s tradeable=%s",
+            snapshot.snapshot_id, snapshot.market_outlook, fresh, date_match, snapshot.is_tradeable_session,
+        )
+
+        # Reject stale snapshots — do not trade on outdated research
+        if not fresh:
+            logger.warning(
+                "Research snapshot %s is stale (created_at=%s). Suspending new entries.",
+                snapshot.snapshot_id, snapshot.created_at.isoformat(),
             )
+            cycle_results["status"] = "SUSPENDED"
+            cycle_results["reason"] = "STALE_SNAPSHOT"
+            return cycle_results
 
-            # Reject stale snapshots — do not trade on outdated research
-            if not fresh:
-                logger.warning(
-                    "Research snapshot %s is stale (created_at=%s). Suspending new entries.",
-                    snapshot.snapshot_id, snapshot.created_at.isoformat(),
-                )
-                cycle_results["status"] = "SUSPENDED"
-                cycle_results["reason"] = "STALE_SNAPSHOT"
-                return cycle_results
+        # Reject wrong-date snapshots — snapshot must match today's trading date
+        if not date_match:
+            logger.warning(
+                "Research snapshot %s is for date %s, not today's session %s. Suspending new entries.",
+                snapshot.snapshot_id, snapshot.trading_date, active_date,
+            )
+            cycle_results["status"] = "SUSPENDED"
+            cycle_results["reason"] = "SNAPSHOT_DATE_MISMATCH"
+            return cycle_results
 
-            # Reject wrong-date snapshots — snapshot must match today's trading date
-            if not date_match:
-                logger.warning(
-                    "Research snapshot %s is for date %s, not today's session %s. Suspending new entries.",
-                    snapshot.snapshot_id, snapshot.trading_date, active_date,
-                )
-                cycle_results["status"] = "SUSPENDED"
-                cycle_results["reason"] = "SNAPSHOT_DATE_MISMATCH"
-                return cycle_results
+        if not snapshot.is_tradeable_session:
+            logger.info("Snapshot specifies non-tradeable session (%s). Skipping new entries.", snapshot.no_trade_reason)
+            cycle_results["status"] = "SKIPPED"
+            cycle_results["reason"] = snapshot.no_trade_reason
+            return cycle_results
 
-            if not snapshot.is_tradeable_session:
-                logger.info("Snapshot specifies non-tradeable session (%s). Skipping new entries.", snapshot.no_trade_reason)
-                cycle_results["status"] = "SKIPPED"
-                cycle_results["reason"] = snapshot.no_trade_reason
-                return cycle_results
+        if snapshot.market_outlook == "HIGH_RISK":
+            logger.info("Research outlook is HIGH_RISK. New trade entries suspended for safety.")
+            cycle_results["status"] = "SUSPENDED"
+            cycle_results["reason"] = "HIGH_RISK_OUTLOOK"
+            return cycle_results
 
-            if snapshot.market_outlook == "HIGH_RISK":
-                logger.info("Research outlook is HIGH_RISK. New trade entries suspended for safety.")
-                cycle_results["status"] = "SUSPENDED"
-                cycle_results["reason"] = "HIGH_RISK_OUTLOOK"
-                return cycle_results
+        # Candidate selection from watchlist (ranked) then allowed_symbols fallback
+        if snapshot.watchlist:
+            allowed_symbols = [w["symbol"] for w in snapshot.watchlist if "symbol" in w][:5]
+        elif snapshot.allowed_symbols:
+            allowed_symbols = snapshot.allowed_symbols[:5]
 
-            # Candidate selection from watchlist (ranked) then allowed_symbols fallback
-            if snapshot.watchlist:
-                allowed_symbols = [w["symbol"] for w in snapshot.watchlist if "symbol" in w][:5]
-            elif snapshot.allowed_symbols:
-                allowed_symbols = snapshot.allowed_symbols[:5]
-
-            if not allowed_symbols:
-                logger.warning("Snapshot %s has no watchlist or allowed_symbols. Suspending new entries.", snapshot.snapshot_id)
-                cycle_results["status"] = "SUSPENDED"
-                cycle_results["reason"] = "EMPTY_WATCHLIST"
-                return cycle_results
-        else:
-            logger.info("No research snapshot available. Falling back to default high-liquidity universe.")
-            allowed_symbols = ["SBIN", "TCS", "HDFCBANK", "INFY", "RELIANCE"]
+        if not allowed_symbols:
+            logger.warning("Snapshot %s has no watchlist or allowed_symbols. Suspending new entries.", snapshot.snapshot_id)
+            cycle_results["status"] = "SUSPENDED"
+            cycle_results["reason"] = "EMPTY_WATCHLIST"
+            return cycle_results
 
         logger.info("Evaluation candidates (%d): %s", len(allowed_symbols), allowed_symbols)
         cycle_results["evaluated"] = len(allowed_symbols)

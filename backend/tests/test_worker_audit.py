@@ -31,11 +31,17 @@ from backend.app.models.domain import (
     Signal,
     SignalDirection,
 )
+from backend.app.persistence.supabase_trader import (
+    PROD_BOT_USER_ID,
+    ensure_trading_account,
+    persist_trade_cycle,
+)
 from backend.app.risk.engine import RiskEngine
 from backend.app.strategies.vwap_orb_strategy import VWAP_ORB_Strategy
 from backend.app.trading_engine import TradingEngine
 from backend.app.worker import IntradayWorker
 from research.models import ResearchSnapshot
+from research.persistence import save_snapshot
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 UTC = timezone.utc
@@ -406,6 +412,100 @@ class TestProductionPaperWorkerAudit(unittest.TestCase):
         paper_adapter = PaperExecutionAdapter()
         self.assertFalse(hasattr(paper_adapter, "placeOrder"))
         self.assertFalse(hasattr(paper_adapter, "smartConnect"))
+
+    # -------------------------------------------------------------------------
+    # 6. Missing research snapshot suspends entries (no cross-date fallback)
+    # -------------------------------------------------------------------------
+    def test_missing_research_snapshot_suspends_new_entries(self):
+        """Worker must suspend new trade entries when no research snapshot exists for active_date."""
+        worker = IntradayWorker.__new__(IntradayWorker)
+        worker.mode = TradingMode.PAPER
+        worker.worker_id = "test-missing-research"
+        worker.traded_symbols_today = set()
+        worker.conn = None
+        worker.account_id = None
+        worker.execution_adapter = PaperExecutionAdapter(starting_capital=100_000.0)
+        worker.engine = MagicMock()
+        worker.engine.evaluate_open_positions.return_value = []
+
+        with patch("backend.app.worker.load_latest_snapshot", return_value=None):
+            res = worker.run_cycle(session_date=self.today)
+            self.assertEqual(res["status"], "SUSPENDED")
+            self.assertEqual(res["reason"], "MISSING_RESEARCH_SNAPSHOT")
+            self.assertEqual(res["orders"], 0)
+
+    # -------------------------------------------------------------------------
+    # 7. Wrong-date snapshot suspends entries
+    # -------------------------------------------------------------------------
+    def test_wrong_date_snapshot_suspends_new_entries(self):
+        """Worker must reject research snapshots whose trading_date != active_date."""
+        worker = IntradayWorker.__new__(IntradayWorker)
+        worker.mode = TradingMode.PAPER
+        worker.worker_id = "test-wrong-date"
+        worker.traded_symbols_today = set()
+        worker.conn = None
+        worker.account_id = None
+        worker.execution_adapter = PaperExecutionAdapter(starting_capital=100_000.0)
+        worker.engine = MagicMock()
+        worker.engine.evaluate_open_positions.return_value = []
+
+        yesterday = self.today - datetime.timedelta(days=1)
+        wrong_date_snap = ResearchSnapshot(
+            snapshot_id="RS-WRONG-DATE",
+            created_at=datetime.datetime.now(UTC),
+            session_type="pre_market",
+            trading_date=str(yesterday),
+            market_outlook="NEUTRAL",
+            is_tradeable_session=True,
+            allowed_symbols=["SBIN"],
+            watchlist=[{"symbol": "SBIN"}],
+        )
+
+        with patch("backend.app.worker.load_latest_snapshot", return_value=wrong_date_snap), \
+             patch("backend.app.worker.is_snapshot_fresh", return_value=True):
+            res = worker.run_cycle(session_date=self.today)
+            self.assertEqual(res["status"], "SUSPENDED")
+            self.assertEqual(res["reason"], "SNAPSHOT_DATE_MISMATCH")
+            self.assertEqual(res["orders"], 0)
+
+    # -------------------------------------------------------------------------
+    # 8. Test isolation guards fail closed
+    # -------------------------------------------------------------------------
+    def test_test_isolation_fail_closed_guards(self):
+        """Tests attempting to write to production user or production snapshot must fail closed."""
+        mock_conn = MagicMock()
+
+        # 1. Attempting to ensure trading account for production user during tests must raise RuntimeError
+        with self.assertRaises(RuntimeError) as ctx1:
+            ensure_trading_account(mock_conn, user_id=PROD_BOT_USER_ID)
+        self.assertIn("Test isolation violation", str(ctx1.exception))
+
+        # 2. Attempting to persist trade cycle for production user during tests must raise RuntimeError
+        with self.assertRaises(RuntimeError) as ctx2:
+            persist_trade_cycle(
+                conn=mock_conn,
+                user_id=PROD_BOT_USER_ID,
+                account_id="some-account",
+                symbol="SBIN",
+                direction="buy",
+                signal_price=800.0,
+                fill_price=800.0,
+                quantity=10,
+            )
+        self.assertIn("Test isolation violation", str(ctx2.exception))
+
+        # 3. Attempting to save pre_market snapshot during tests must raise RuntimeError
+        snap = ResearchSnapshot(
+            snapshot_id="RS-ISOLATION-CHECK",
+            created_at=datetime.datetime.now(UTC),
+            session_type="pre_market",
+            trading_date=str(self.today),
+            market_outlook="NEUTRAL",
+            is_tradeable_session=True,
+        )
+        with self.assertRaises(RuntimeError) as ctx3:
+            save_snapshot(snap)
+        self.assertIn("Test isolation violation", str(ctx3.exception))
 
 
 if __name__ == "__main__":
