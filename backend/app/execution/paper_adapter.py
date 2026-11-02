@@ -175,6 +175,38 @@ class PaperExecutionAdapter(ExecutionAdapter):
 
         return pos
 
+    def revert_position_to_open(self, position_id: str) -> None:
+        """Rollback a closed position back to OPEN if persistence fails, keeping ledger synchronized."""
+        pos = self.positions.get(position_id)
+        if not pos or pos.status != PositionStatus.CLOSED:
+            return
+
+        exit_side = "SELL" if pos.direction == SignalDirection.BUY else "BUY"
+        exit_fees = TransactionCostModel.calculate_leg_costs(
+            quantity=pos.quantity,
+            price=pos.exit_price or pos.entry_price,
+            side=exit_side,
+        )
+        gross_pnl = (
+            round((pos.exit_price - pos.entry_price) * pos.quantity, 2)
+            if pos.direction == SignalDirection.BUY
+            else round((pos.entry_price - pos.exit_price) * pos.quantity, 2)
+        )
+        returned_cash = (pos.quantity * pos.entry_price) + gross_pnl - exit_fees
+        net_pnl = round(gross_pnl - (pos.entry_fees + exit_fees), 2)
+
+        self.account.cash_balance -= returned_cash
+        self.account.deployed_margin += (pos.quantity * pos.entry_price)
+        self.account.realized_pnl_today -= net_pnl
+        self.account.trades_count_today -= 1
+        self.account.is_daily_loss_breached = False
+
+        pos.status = PositionStatus.OPEN
+        pos.exit_price = None
+        pos.exit_time = None
+        pos.exit_reason = None
+        pos.realized_pnl = 0.0
+
     def get_account_state(self) -> AccountState:
         return self.account
 

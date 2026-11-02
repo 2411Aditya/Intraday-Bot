@@ -47,8 +47,10 @@ from backend.app.market_data.angelone_provider import AngelOneProvider
 from backend.app.market_data.mock_provider import MockMarketDataProvider
 from backend.app.persistence.supabase_trader import (
     ensure_trading_account,
+    get_daily_account_state,
     get_db_connection,
     get_last_processed_candle_ts,
+    is_position_open_in_db,
     is_symbol_traded_today,
     persist_trade_cycle,
     reserve_trade_slot,
@@ -122,21 +124,40 @@ class IntradayWorker:
         # Idempotency cache: tracks symbols traded today (in-memory fast cache backed by DB)
         self.traded_symbols_today: set[str] = set()
 
-    def _sync_state_from_db(self) -> None:
-        """Syncs account balance and open positions from Supabase on startup/restart."""
+    def _sync_state_from_db(self, active_date: datetime.date | None = None) -> None:
+        """Syncs account balance, daily risk limits, and open positions from Supabase on startup/restart."""
         if not self.conn or not self.account_id:
             return
         try:
-            from backend.app.persistence.supabase_trader import get_account_ledger, get_open_positions_from_db
-            ledger = get_account_ledger(self.conn, self.account_id)
-            if ledger and ledger.get("cash_balance") is not None:
-                db_cash = ledger["cash_balance"]
-                db_deployed = ledger.get("deployed_margin", 0.0)
+            from backend.app.persistence.supabase_trader import (
+                get_daily_account_state,
+                get_open_positions_from_db,
+            )
+            today = active_date or datetime.datetime.now(IST).date()
+            daily_state = get_daily_account_state(self.conn, self.account_id, today)
+
+            if daily_state.get("cash_balance") is not None:
+                db_cash = daily_state["cash_balance"]
+                db_deployed = daily_state.get("deployed_margin") or 0.0
                 # Only sync if account has activity in Supabase
                 if db_cash > 0 and (db_cash != settings.VIRTUAL_STARTING_CAPITAL or db_deployed > 0):
                     self.execution_adapter.account.cash_balance = db_cash
                     self.execution_adapter.account.deployed_margin = db_deployed
                     logger.info("Restored ledger from Supabase: cash=%.2f deployed=%.2f", db_cash, db_deployed)
+
+            # Restore daily risk counters
+            db_trades = daily_state.get("trades_count_today", 0)
+            db_pnl = daily_state.get("realized_pnl_today", 0.0)
+            self.execution_adapter.account.trades_count_today = db_trades
+            self.execution_adapter.account.realized_pnl_today = db_pnl
+            if (
+                db_pnl < 0 and abs(db_pnl) >= self.execution_adapter.account.max_daily_loss_budget
+            ) or self.execution_adapter.account.daily_loss_pct >= self.risk_engine.max_daily_loss_pct:
+                self.execution_adapter.account.is_daily_loss_breached = True
+            logger.info(
+                "Restored daily risk state: trades_count=%d realized_pnl=%.2f breach=%s",
+                db_trades, db_pnl, self.execution_adapter.account.is_daily_loss_breached,
+            )
 
             # Restore open positions
             open_db_positions = get_open_positions_from_db(self.conn, self.account_id)
@@ -190,74 +211,15 @@ class IntradayWorker:
 
         logger.info("--- Starting Intraday Evaluation Cycle (date=%s, time=%s IST) ---", active_date, now_ist.strftime("%H:%M:%S"))
 
-        # 1. Check research snapshot
-        snapshot: ResearchSnapshot | None = None
-        try:
-            snapshot = load_latest_snapshot("pre_market") or load_latest_snapshot()
-        except Exception as e:
-            logger.warning("Could not query research snapshot from DB: %s", e)
-
-        # Research gating policy
-        allowed_symbols: list[str] = []
-        if snapshot:
-            fresh = is_snapshot_fresh(snapshot)
-            date_match = (snapshot.trading_date == str(active_date))
-            logger.info(
-                "Found snapshot id=%s outlook=%s fresh=%s date_match=%s tradeable=%s",
-                snapshot.snapshot_id, snapshot.market_outlook, fresh, date_match, snapshot.is_tradeable_session,
-            )
-
-            # Reject stale snapshots — do not trade on outdated research
-            if not fresh:
-                logger.warning(
-                    "Research snapshot %s is stale (created_at=%s). Suspending new entries.",
-                    snapshot.snapshot_id, snapshot.created_at.isoformat(),
-                )
-                return {"status": "SUSPENDED", "reason": "STALE_SNAPSHOT"}
-
-            # Reject wrong-date snapshots — snapshot must match today's trading date
-            if not date_match:
-                logger.warning(
-                    "Research snapshot %s is for date %s, not today's session %s. Suspending new entries.",
-                    snapshot.snapshot_id, snapshot.trading_date, active_date,
-                )
-                return {"status": "SUSPENDED", "reason": "SNAPSHOT_DATE_MISMATCH"}
-
-            if not snapshot.is_tradeable_session:
-                logger.info("Snapshot specifies non-tradeable session (%s). Skipping.", snapshot.no_trade_reason)
-                return {"status": "SKIPPED", "reason": snapshot.no_trade_reason}
-
-            if snapshot.market_outlook == "HIGH_RISK":
-                logger.info("Research outlook is HIGH_RISK. New trade entries suspended for safety.")
-                return {"status": "SUSPENDED", "reason": "HIGH_RISK_OUTLOOK"}
-
-            # Candidate selection from watchlist (ranked) then allowed_symbols fallback
-            if snapshot.watchlist:
-                allowed_symbols = [w["symbol"] for w in snapshot.watchlist if "symbol" in w][:5]
-            elif snapshot.allowed_symbols:
-                allowed_symbols = snapshot.allowed_symbols[:5]
-
-            if not allowed_symbols:
-                logger.warning("Snapshot %s has no watchlist or allowed_symbols. Suspending.", snapshot.snapshot_id)
-                return {"status": "SUSPENDED", "reason": "EMPTY_WATCHLIST"}
-        else:
-            logger.info("No research snapshot available. Falling back to default high-liquidity universe.")
-            allowed_symbols = ["SBIN", "TCS", "HDFCBANK", "INFY", "RELIANCE"]
-
-        logger.info("Evaluation candidates (%d): %s", len(allowed_symbols), allowed_symbols)
-
-        # 2. Window for 5-minute candles
-        session_start = datetime.datetime.combine(active_date, datetime.time(9, 15), tzinfo=IST)
-        session_end = datetime.datetime.combine(active_date, datetime.time(15, 30), tzinfo=IST)
-
         cycle_results = {
-            "evaluated": len(allowed_symbols),
+            "evaluated": 0,
             "signals": 0,
             "orders": 0,
             "closed_positions": 0,
         }
 
-        # 3. Monitor existing open positions first (exits take priority over entries)
+        # 1. Open Position Monitoring & Exits ALWAYS run first
+        # (Positions must be checked and closed even when research is HIGH_RISK, stale, missing, or entry session is closed)
         quotes: dict[str, float] = {}
         for pos in self.execution_adapter.get_open_positions():
             try:
@@ -273,28 +235,105 @@ class IntradayWorker:
             if self.conn and self.account_id:
                 for c_pos in closed:
                     try:
-                        from backend.app.models.domain import SignalDirection
-                        exit_direction = "sell" if c_pos.direction == SignalDirection.BUY else "buy"
-                        exit_fees = TransactionCostModel.calculate_leg_costs(
-                            quantity=c_pos.quantity,
-                            price=c_pos.exit_price,
-                            side=exit_direction.upper(),
-                        )
-                        persist_trade_cycle(
-                            conn=self.conn,
-                            user_id=self.system_user_id,
-                            account_id=self.account_id,
-                            symbol=c_pos.symbol,
-                            direction=exit_direction,
-                            signal_price=c_pos.exit_price,
-                            fill_price=c_pos.exit_price,
-                            quantity=c_pos.quantity,
-                            fees=exit_fees,
-                            research_snapshot_id=snapshot.snapshot_id if snapshot else None,
-                        )
-                        logger.info("Persisted exit trade cycle to Supabase for %s", c_pos.symbol)
+                        # Idempotency check: only persist if position is still open in DB
+                        if is_position_open_in_db(self.conn, self.account_id, c_pos.symbol):
+                            from backend.app.models.domain import SignalDirection
+                            exit_direction = "sell" if c_pos.direction == SignalDirection.BUY else "buy"
+                            exit_fees = TransactionCostModel.calculate_leg_costs(
+                                quantity=c_pos.quantity,
+                                price=c_pos.exit_price,
+                                side=exit_direction.upper(),
+                            )
+                            persist_trade_cycle(
+                                conn=self.conn,
+                                user_id=self.system_user_id,
+                                account_id=self.account_id,
+                                symbol=c_pos.symbol,
+                                direction=exit_direction,
+                                signal_price=c_pos.exit_price,
+                                fill_price=c_pos.exit_price,
+                                quantity=c_pos.quantity,
+                                fees=exit_fees,
+                                research_snapshot_id=None,
+                            )
+                            logger.info("Persisted exit trade cycle to Supabase for %s", c_pos.symbol)
+                        else:
+                            logger.info("Position for %s is already closed in DB. Skipping duplicate exit persistence.", c_pos.symbol)
                     except Exception as e:
-                        logger.error("Failed to persist exit trade cycle to Supabase: %s", e)
+                        logger.error("Failed to persist exit trade cycle to Supabase for %s: %s. Reverting position to OPEN in memory for retry.", c_pos.symbol, e)
+                        self.execution_adapter.revert_position_to_open(c_pos.position_id)
+                        cycle_results["closed_positions"] -= 1
+
+        # 2. Check research snapshot for new trade entries
+        snapshot: ResearchSnapshot | None = None
+        try:
+            snapshot = load_latest_snapshot("pre_market") or load_latest_snapshot()
+        except Exception as e:
+            logger.warning("Could not query research snapshot from DB: %s", e)
+
+        # Research gating policy for new entries
+        allowed_symbols: list[str] = []
+        if snapshot:
+            fresh = is_snapshot_fresh(snapshot)
+            date_match = (snapshot.trading_date == str(active_date))
+            logger.info(
+                "Found snapshot id=%s outlook=%s fresh=%s date_match=%s tradeable=%s",
+                snapshot.snapshot_id, snapshot.market_outlook, fresh, date_match, snapshot.is_tradeable_session,
+            )
+
+            # Reject stale snapshots — do not trade on outdated research
+            if not fresh:
+                logger.warning(
+                    "Research snapshot %s is stale (created_at=%s). Suspending new entries.",
+                    snapshot.snapshot_id, snapshot.created_at.isoformat(),
+                )
+                cycle_results["status"] = "SUSPENDED"
+                cycle_results["reason"] = "STALE_SNAPSHOT"
+                return cycle_results
+
+            # Reject wrong-date snapshots — snapshot must match today's trading date
+            if not date_match:
+                logger.warning(
+                    "Research snapshot %s is for date %s, not today's session %s. Suspending new entries.",
+                    snapshot.snapshot_id, snapshot.trading_date, active_date,
+                )
+                cycle_results["status"] = "SUSPENDED"
+                cycle_results["reason"] = "SNAPSHOT_DATE_MISMATCH"
+                return cycle_results
+
+            if not snapshot.is_tradeable_session:
+                logger.info("Snapshot specifies non-tradeable session (%s). Skipping new entries.", snapshot.no_trade_reason)
+                cycle_results["status"] = "SKIPPED"
+                cycle_results["reason"] = snapshot.no_trade_reason
+                return cycle_results
+
+            if snapshot.market_outlook == "HIGH_RISK":
+                logger.info("Research outlook is HIGH_RISK. New trade entries suspended for safety.")
+                cycle_results["status"] = "SUSPENDED"
+                cycle_results["reason"] = "HIGH_RISK_OUTLOOK"
+                return cycle_results
+
+            # Candidate selection from watchlist (ranked) then allowed_symbols fallback
+            if snapshot.watchlist:
+                allowed_symbols = [w["symbol"] for w in snapshot.watchlist if "symbol" in w][:5]
+            elif snapshot.allowed_symbols:
+                allowed_symbols = snapshot.allowed_symbols[:5]
+
+            if not allowed_symbols:
+                logger.warning("Snapshot %s has no watchlist or allowed_symbols. Suspending new entries.", snapshot.snapshot_id)
+                cycle_results["status"] = "SUSPENDED"
+                cycle_results["reason"] = "EMPTY_WATCHLIST"
+                return cycle_results
+        else:
+            logger.info("No research snapshot available. Falling back to default high-liquidity universe.")
+            allowed_symbols = ["SBIN", "TCS", "HDFCBANK", "INFY", "RELIANCE"]
+
+        logger.info("Evaluation candidates (%d): %s", len(allowed_symbols), allowed_symbols)
+        cycle_results["evaluated"] = len(allowed_symbols)
+
+        # 3. Window for 5-minute candles
+        session_start = datetime.datetime.combine(active_date, datetime.time(9, 15), tzinfo=IST)
+        session_end = datetime.datetime.combine(active_date, datetime.time(15, 30), tzinfo=IST)
 
         # 4. Evaluate candidates for entries
         for symbol in allowed_symbols:

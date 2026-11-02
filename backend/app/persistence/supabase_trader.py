@@ -301,5 +301,64 @@ def get_open_positions_from_db(conn, account_id: str) -> list[dict[str, Any]]:
         ]
 
 
+def is_position_open_in_db(conn, account_id: str, symbol: str) -> bool:
+    """Checks if there is an active open position for this symbol and account in Supabase."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*)
+            FROM positions
+            WHERE account_id = %s AND symbol = %s AND status = 'open' AND quantity > 0;
+            """,
+            (account_id, symbol),
+        )
+        row = cur.fetchone()
+        return bool(row and row[0] > 0)
+
+
+def get_daily_account_state(conn, account_id: str, trading_date: datetime.date) -> dict[str, Any]:
+    """Retrieve full daily ledger and risk state from Supabase for crash recovery."""
+    with conn.cursor() as cur:
+        # 1. Account balances
+        cur.execute("SELECT cash_balance, deployed_margin FROM trading_accounts WHERE id = %s;", (account_id,))
+        acct_row = cur.fetchone()
+
+        # 2. Filled trades count today
+        cur.execute(
+            """
+            SELECT count(*)
+            FROM order_intents i
+            JOIN orders o ON o.intent_id = i.id
+            WHERE i.account_id = %s
+              AND DATE(i.created_at AT TIME ZONE 'Asia/Kolkata') = %s
+              AND o.status IN ('filled', 'partial');
+            """,
+            (account_id, trading_date),
+        )
+        trades_count = cur.fetchone()[0]
+
+        # 3. Realized PnL today
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(realized_pnl), 0)
+            FROM positions
+            WHERE account_id = %s
+              AND status = 'closed'
+              AND close_timestamp IS NOT NULL
+              AND DATE(close_timestamp AT TIME ZONE 'Asia/Kolkata') = %s;
+            """,
+            (account_id, trading_date),
+        )
+        realized_pnl = float(cur.fetchone()[0])
+
+    return {
+        "cash_balance": float(acct_row[0]) if acct_row else None,
+        "deployed_margin": float(acct_row[1]) if acct_row else None,
+        "trades_count_today": trades_count,
+        "realized_pnl_today": realized_pnl,
+    }
+
+
+
 
 
