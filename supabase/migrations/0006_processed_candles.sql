@@ -36,3 +36,4 @@ END
 $$;
 
 GRANT ALL ON TABLE processed_candles TO service_role;
+

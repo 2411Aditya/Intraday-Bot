@@ -308,6 +308,68 @@ class TestInMemoryRetryIdempotency(unittest.TestCase):
         self.assertIn(candle_key, engine._processed_candles)
 
 
+class TestCrashRetryIdempotency(unittest.TestCase):
+    """Simulates process crash after order persistence but before candle marking."""
+
+    def test_crash_after_order_persistence_prevents_duplicate_on_retry(self):
+        """If a crash happens after persist_trade_cycle, retry worker must detect is_symbol_traded_today and skip."""
+        today = datetime.datetime.now(IST).date()
+        snap = _fresh_snap(today)
+
+        # Worker instance represents the NEW process after restart
+        worker = _make_worker_no_db()
+        worker.conn = MagicMock()
+        worker.account_id = "test-acct-crash-sim"
+
+        # Mock is_symbol_traded_today returning True (simulating order already exists in DB from crashed run)
+        with patch("backend.app.worker.load_latest_snapshot", return_value=snap), \
+             patch("backend.app.worker.is_snapshot_fresh", return_value=True), \
+             patch("backend.app.worker.is_symbol_traded_today", return_value=True), \
+             patch.object(worker.engine, "process_symbol") as mock_process:
+
+            res = worker.run_cycle(session_date=today)
+
+            # process_symbol must NEVER have been called for SBIN
+            mock_process.assert_not_called()
+            # No orders executed
+            self.assertEqual(res["orders"], 0)
+            # Symbol marked in memory as already traded today
+            self.assertIn("SBIN", worker.traded_symbols_today)
+
+    def test_concurrent_worker_reservation_conflict_aborts_duplicate_persistence(self):
+        """If reserve_trade_slot returns False (concurrent worker won the race), skip persistence."""
+        today = datetime.datetime.now(IST).date()
+        snap = _fresh_snap(today)
+
+        worker = _make_worker_no_db()
+        worker.conn = MagicMock()
+        worker.account_id = "test-acct-race-sim"
+
+        mock_signal = MagicMock()
+        mock_signal.direction.value = "BUY"
+        mock_signal.entry_price = 800.0
+        mock_signal.timestamp = datetime.datetime.now(IST)
+
+        mock_order = MagicMock()
+        mock_order.quantity = 10
+        mock_order.price = 800.0
+        mock_order.average_fill_price = 800.0
+        mock_order.direction.value = "BUY"
+        mock_order.status.value = "FILLED"
+
+        with patch("backend.app.worker.load_latest_snapshot", return_value=snap), \
+             patch("backend.app.worker.is_snapshot_fresh", return_value=True), \
+             patch("backend.app.worker.is_symbol_traded_today", return_value=False), \
+             patch.object(worker.engine, "process_symbol", return_value=(mock_signal, mock_order)), \
+             patch("backend.app.worker.reserve_trade_slot", return_value=False), \
+             patch("backend.app.worker.persist_trade_cycle") as mock_persist:
+
+            res = worker.run_cycle(session_date=today)
+
+            # Because reserve_trade_slot returned False, persist_trade_cycle must NOT be called
+            mock_persist.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
 

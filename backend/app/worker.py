@@ -392,7 +392,13 @@ class IntradayWorker:
                     if self.conn and self.account_id:
                         try:
                             # 1. Atomic symbol-level reservation (prevents concurrent workers)
-                            reserve_trade_slot(self.conn, self.account_id, symbol, active_date, self.worker_id)
+                            slot_acquired = reserve_trade_slot(self.conn, self.account_id, symbol, active_date, self.worker_id)
+                            if not slot_acquired:
+                                logger.warning(
+                                    "Trade slot for %s on %s already reserved by another worker/run. Skipping duplicate persistence.",
+                                    symbol, active_date,
+                                )
+                                continue
                             leg_fees = TransactionCostModel.calculate_leg_costs(
                                 quantity=order.quantity,
                                 price=order.average_fill_price,
