@@ -57,3 +57,33 @@ jobs:
           fi
           python -m backend.app.worker --run-once $EXTRA_FLAGS
 
+      # Emergency square-off safety cycle.
+      # If the regular 15-min cron is delayed past 15:15 IST (09:45 UTC), positions
+      # could be carried past intraday close. This step runs an additional forced cycle
+      # after the main run — the worker's own 15:15 IST logic will square off all open
+      # positions at the current LTP. Idempotent: already-closed positions are skipped.
+      - name: Emergency Square-Off Safety Cycle (post-15:15 IST only)
+        env:
+          ANGELONE_API_KEY: ${{ secrets.ANGELONE_API_KEY }}
+          ANGELONE_CLIENT_ID: ${{ secrets.ANGELONE_CLIENT_ID }}
+          ANGELONE_PASSWORD: ${{ secrets.ANGELONE_PASSWORD }}
+          ANGELONE_TOTP_SECRET: ${{ secrets.ANGELONE_TOTP_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TRADING_MODE: 'paper'
+          LIVE_TRADING_ENABLED: 'false'
+        run: |
+          # Only run if current UTC time >= 09:45 (= 15:15 IST) — square-off window
+          HOUR=$(date -u +%H)
+          MIN=$(date -u +%M)
+          TOTAL_MINS=$((HOUR * 60 + MIN))
+          SQUAREOFF_MINS=$((9 * 60 + 45))   # 09:45 UTC = 15:15 IST
+          CLOSE_MINS=$((10 * 60 + 30))       # 10:30 UTC = 16:00 IST (do not run after market close)
+          if [ "$TOTAL_MINS" -ge "$SQUAREOFF_MINS" ] && [ "$TOTAL_MINS" -le "$CLOSE_MINS" ]; then
+            echo "Post-15:15 IST detected — running emergency square-off cycle"
+            python -m backend.app.worker --run-once --force-session
+          else
+            echo "Pre-square-off window (UTC ${HOUR}:${MIN}). Emergency cycle skipped."
+          fi
+

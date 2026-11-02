@@ -71,21 +71,35 @@ class AngelOneProvider(MarketDataProvider):
         """Return the NSE exchange token for the given trading symbol.
 
         NSE index tokens are hard-coded because searchScrip does not return them.
-        For equity symbols, searchScrip is called and the exact match is used.
+        For equity symbols, searchScrip is called and the exact ``-EQ`` match is used.
+        If no exact match is found the first result is used with a WARNING — this may
+        return a futures/options token for ambiguous symbols, so operators should verify
+        Angel One token correctness for each symbol in the watchlist.
         """
+        import logging as _logging
+        _log = _logging.getLogger("IntradayBot.AngelOneProvider")
+
         upper = symbol.upper()
         if upper in self._INDEX_TOKENS:
             return self._INDEX_TOKENS[upper]
 
-        # Equity lookup via searchScrip
+        # Equity lookup via searchScrip — prefer exact ``SYMBOL-EQ`` match
         result = self._client.searchScrip("NSE", symbol)
         for item in result.get("data", []):
             if item.get("tradingsymbol", "").upper() == upper + "-EQ":
                 return str(item.get("symboltoken"))
-        # Fallback: first NSE result
+
+        # Fallback: first NSE result (may be F&O token — log clearly)
         data = result.get("data", [])
         if data:
-            return str(data[0].get("symboltoken"))
+            fallback_token = str(data[0].get("symboltoken"))
+            fallback_scrip = data[0].get("tradingsymbol", "UNKNOWN")
+            _log.warning(
+                "NSE token: no exact -EQ match for '%s'; falling back to first result "
+                "'%s' (token=%s). Verify this is the correct equity token.",
+                symbol, fallback_scrip, fallback_token,
+            )
+            return fallback_token
         raise ValueError(f"No NSE instrument token found for symbol: {symbol}")
 
     # ------------------------------------------------------------------
@@ -142,10 +156,26 @@ class AngelOneProvider(MarketDataProvider):
         return candles
 
     def get_latest_candle(self, symbol: str, timeframe: str) -> Candle | None:
-        now = dt.datetime.now(zoneinfo.ZoneInfo("Asia/Kolkata"))
+        """Return the most recently completed 5-minute candle.
+
+        Raises RuntimeError if the latest candle is more than 10 minutes old —
+        this prevents the worker from acting on stale cached data from the API.
+        """
+        ist = zoneinfo.ZoneInfo("Asia/Kolkata")
+        now = dt.datetime.now(ist)
         start = now - dt.timedelta(hours=1)
         candles = self.get_historical_candles(symbol, timeframe, start, now)
-        return candles[-1] if candles else None
+        if not candles:
+            return None
+        latest = candles[-1]
+        age_seconds = (now - latest.timestamp.astimezone(ist)).total_seconds()
+        if age_seconds > 600:  # 10 minutes
+            raise RuntimeError(
+                f"Stale market data for {symbol}: latest candle is "
+                f"{int(age_seconds / 60)}m old (> 10m threshold). "
+                "Angel One API may be returning cached/delayed data."
+            )
+        return latest
 
     def get_current_quote(self, symbol: str) -> MarketTick:
         self._authenticate()

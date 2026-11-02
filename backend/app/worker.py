@@ -228,7 +228,7 @@ class IntradayWorker:
             except Exception as e:
                 logger.warning("Could not fetch quote for open position %s: %s", pos.symbol, e)
 
-        closed = self.engine.evaluate_open_positions(quotes)
+        closed = self.engine.evaluate_open_positions(quotes, current_time=current_time)
         cycle_results["closed_positions"] = len(closed)
         if closed:
             logger.info("Closed %d positions during cycle", len(closed))

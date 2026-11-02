@@ -148,8 +148,23 @@ class TradingEngine:
 
         return latest_signal, executed_order
 
-    def evaluate_open_positions(self, current_quotes: dict[str, float]) -> list[Position]:
-        """Monitors open positions against structural stop loss and target prices."""
+    def evaluate_open_positions(
+        self,
+        current_quotes: dict[str, float],
+        current_time: datetime | None = None,
+    ) -> list[Position]:
+        """Monitors open positions against structural stop loss, target prices, and intraday square-off.
+
+        Square-off rule: Any position still open at or after 15:15 IST is forcibly closed
+        at the current market price, regardless of stop-loss or target status. This prevents
+        illegal overnight carry of intraday paper positions.
+        """
+        IST = zoneinfo.ZoneInfo("Asia/Kolkata")
+        SQUARE_OFF_TIME = time(15, 15)
+
+        now_ist = (current_time.astimezone(IST) if current_time else datetime.now(IST))
+        must_square_off = now_ist.time() >= SQUARE_OFF_TIME
+
         closed_positions: list[Position] = []
         open_positions = self.execution.get_open_positions()
 
@@ -159,6 +174,18 @@ class TradingEngine:
                 continue
 
             pos.current_price = price
+
+            # Compulsory intraday square-off at 15:15 IST — takes priority over SL/TP
+            if must_square_off:
+                logger.info(
+                    "SQUARE_OFF: Forcing close of %s at %.2f (time=%s IST >= 15:15)",
+                    pos.symbol, price, now_ist.strftime("%H:%M"),
+                )
+                closed = self.execution.close_position(
+                    pos.position_id, exit_price=price, reason="INTRADAY_SQUARE_OFF"
+                )
+                closed_positions.append(closed)
+                continue
 
             # Long position exits
             if pos.direction == SignalDirection.BUY:

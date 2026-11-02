@@ -135,10 +135,17 @@ class PaperExecutionAdapter(ExecutionAdapter):
         # Model exit slippage
         slippage_amount = round(exit_price * self.slippage_rate, 2)
         if pos.direction == SignalDirection.BUY:
-            actual_exit = round(exit_price - slippage_amount, 2)  # Adverse exit on sell
+            # Skip slippage for forced square‑off to reflect exact market price
+            if reason == "INTRADAY_SQUARE_OFF":
+                actual_exit = round(exit_price, 2)
+            else:
+                actual_exit = round(exit_price - slippage_amount, 2)  # Adverse exit on sell
             gross_pnl = round((actual_exit - pos.entry_price) * pos.quantity, 2)
         else:
-            actual_exit = round(exit_price + slippage_amount, 2)  # Adverse exit on buy-to-cover
+            if reason == "INTRADAY_SQUARE_OFF":
+                actual_exit = round(exit_price, 2)
+            else:
+                actual_exit = round(exit_price + slippage_amount, 2)  # Adverse exit on buy-to-cover
             gross_pnl = round((pos.entry_price - actual_exit) * pos.quantity, 2)
 
         # Calculate exit leg fees and total trade statutory fees
