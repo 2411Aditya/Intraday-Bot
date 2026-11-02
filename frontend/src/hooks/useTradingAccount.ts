@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { supabase, TARGET_ACCOUNT_ID } from '../lib/supabase';
+import { useAuth } from '../context/AuthContext';
 import type { TradingAccount, AccountSnapshot, WorkerCandleState } from '../types';
 import { STARTING_CAPITAL_INR } from '../lib/constants';
 
@@ -25,13 +26,14 @@ export function useTradingAccount(): UseTradingAccountResult {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
+  const { user } = useAuth();
 
   const fetchAccountData = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       // Guard: ensure user is authenticated before fetching private data
-  const user = supabase.auth.user();
+
   if (!user) {
     // Not logged in: clear data and stop loading
     setAccount(null);

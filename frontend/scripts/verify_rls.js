@@ -53,3 +53,4 @@ async function checkAuth() {
   await checkAnon();
   await checkAuth();
 })();
+
