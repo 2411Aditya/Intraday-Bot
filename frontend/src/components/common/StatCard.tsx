@@ -29,7 +29,7 @@ export const StatCard: React.FC<StatCardProps> = ({
       className={`bg-white rounded-xl border border-surface-200 p-4 shadow-sm hover:border-slate-300 transition-all ${className}`}
     >
       <div className="flex items-center justify-between gap-2 mb-2">
-        <span className="text-xs font-medium text-slate-500 uppercase tracking-wider truncate">
+        <span className="text-xs font-medium text-slate-500 uppercase tracking-wider whitespace-normal break-words">
           {title}
         </span>
         <div className="flex items-center gap-1.5 flex-shrink-0">
@@ -42,7 +42,7 @@ export const StatCard: React.FC<StatCardProps> = ({
         </div>
       </div>
 
-      <div className="flex items-baseline justify-between gap-2">
+      <div className="flex flex-col sm:flex-row items-baseline justify-between gap-2 flex-wrap min-w-0">
         <div className="text-xl md:text-2xl font-bold tracking-tight text-slate-900 font-mono">
           {value}
         </div>
