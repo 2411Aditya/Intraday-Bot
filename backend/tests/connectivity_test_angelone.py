@@ -134,11 +134,11 @@ def run() -> int:
     ist = zoneinfo.ZoneInfo("Asia/Kolkata")
     test_date = datetime.date(2026, 10, 30)
     weekday = test_date.strftime("%A")
-    print(f"\n[calendar] Test date: {test_date} ({weekday}, weekday={test_date.weekday()}) — weekday OK")
+    print(f"\n[calendar] Test date: {test_date} ({weekday}, weekday={test_date.weekday()}) -- weekday OK")
 
     start_ist = datetime.datetime(2026, 10, 30, 9, 30, tzinfo=ist)
     end_ist   = datetime.datetime(2026, 10, 30, 10, 30, tzinfo=ist)
-    print(f"[candles] Window: {start_ist.isoformat()} → {end_ist.isoformat()} IST (5-min bars, ~12 expected)")
+    print(f"[candles] Window: {start_ist.isoformat()} -> {end_ist.isoformat()} IST (5-min bars, ~12 expected)")
 
     try:
         candles = provider.get_historical_candles(symbol, "5m", start_ist, end_ist)
