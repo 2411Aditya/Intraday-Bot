@@ -158,8 +158,28 @@ class IntradayWorker:
         allowed_symbols: list[str] = []
         if snapshot:
             fresh = is_snapshot_fresh(snapshot)
-            logger.info("Found snapshot id=%s outlook=%s fresh=%s tradeable=%s",
-                        snapshot.snapshot_id, snapshot.market_outlook, fresh, snapshot.is_tradeable_session)
+            date_match = (snapshot.trading_date == str(active_date))
+            logger.info(
+                "Found snapshot id=%s outlook=%s fresh=%s date_match=%s tradeable=%s",
+                snapshot.snapshot_id, snapshot.market_outlook, fresh, date_match, snapshot.is_tradeable_session,
+            )
+
+            # Reject stale snapshots — do not trade on outdated research
+            if not fresh:
+                logger.warning(
+                    "Research snapshot %s is stale (created_at=%s). Suspending new entries.",
+                    snapshot.snapshot_id, snapshot.created_at.isoformat(),
+                )
+                return {"status": "SUSPENDED", "reason": "STALE_SNAPSHOT"}
+
+            # Reject wrong-date snapshots — snapshot must match today's trading date
+            if not date_match:
+                logger.warning(
+                    "Research snapshot %s is for date %s, not today's session %s. Suspending new entries.",
+                    snapshot.snapshot_id, snapshot.trading_date, active_date,
+                )
+                return {"status": "SUSPENDED", "reason": "SNAPSHOT_DATE_MISMATCH"}
+
             if not snapshot.is_tradeable_session:
                 logger.info("Snapshot specifies non-tradeable session (%s). Skipping.", snapshot.no_trade_reason)
                 return {"status": "SKIPPED", "reason": snapshot.no_trade_reason}
@@ -168,11 +188,15 @@ class IntradayWorker:
                 logger.info("Research outlook is HIGH_RISK. New trade entries suspended for safety.")
                 return {"status": "SUSPENDED", "reason": "HIGH_RISK_OUTLOOK"}
 
-            # Candidate selection from watchlist
+            # Candidate selection from watchlist (ranked) then allowed_symbols fallback
             if snapshot.watchlist:
                 allowed_symbols = [w["symbol"] for w in snapshot.watchlist if "symbol" in w][:5]
             elif snapshot.allowed_symbols:
                 allowed_symbols = snapshot.allowed_symbols[:5]
+
+            if not allowed_symbols:
+                logger.warning("Snapshot %s has no watchlist or allowed_symbols. Suspending.", snapshot.snapshot_id)
+                return {"status": "SUSPENDED", "reason": "EMPTY_WATCHLIST"}
         else:
             logger.info("No research snapshot available. Falling back to default high-liquidity universe.")
             allowed_symbols = ["SBIN", "TCS", "HDFCBANK", "INFY", "RELIANCE"]
