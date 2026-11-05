@@ -59,16 +59,29 @@ jobs:
             echo "session=${{ github.event.inputs.session }}" >> $GITHUB_OUTPUT
             echo "force=${{ github.event.inputs.force }}" >> $GITHUB_OUTPUT
           else
-            # Derive session from UTC hour
-            HOUR=$(date -u +%H)
-            if [ "$HOUR" -ge 17 ]; then
-              echo "session=overnight" >> $GITHUB_OUTPUT
-            elif [ "$HOUR" -ge 10 ]; then
-              echo "session=post_market" >> $GITHUB_OUTPUT
-            else
-              echo "session=pre_market" >> $GITHUB_OUTPUT
-            fi
+            # Deterministic mapping from cron schedule to session type.
+            # Using the schedule string avoids misclassification when GitHub Actions
+            # runs a job late (e.g., delayed 2h → wrong UTC hour).
+            SCHEDULE="${{ github.event.schedule }}"
+            echo "[research] Triggered by schedule: '${SCHEDULE}'"
+            case "$SCHEDULE" in
+              "0 3 * * 1-5")
+                SESSION="pre_market"
+                ;;
+              "30 10 * * 1-5")
+                SESSION="post_market"
+                ;;
+              "30 17 * * 0-4")
+                SESSION="overnight"
+                ;;
+              *)
+                echo "ERROR: Unknown schedule '${SCHEDULE}'. Cannot determine session type safely. Aborting."
+                exit 1
+                ;;
+            esac
+            echo "session=${SESSION}" >> $GITHUB_OUTPUT
             echo "force=false" >> $GITHUB_OUTPUT
+            echo "[research] Resolved session: ${SESSION}"
           fi
 
       - name: Execute Research Engine

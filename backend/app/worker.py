@@ -206,12 +206,22 @@ class IntradayWorker:
 
         return True, "Market is OPEN"
 
-    def run_cycle(self, session_date: datetime.date | None = None, current_time: datetime.datetime | None = None) -> dict:
-        """Run a single evaluation cycle across candidate stocks."""
+    def run_cycle(self, session_date: datetime.date | None = None, current_time: datetime.datetime | None = None, close_only: bool = False) -> dict:
+        """Run a single evaluation cycle across candidate stocks.
+
+        Args:
+            session_date: The trading date to evaluate. Defaults to today IST.
+            current_time: Override for current time (used in tests). Defaults to now IST.
+            close_only: If True, only close existing open positions. Never opens new entries.
+                        Safe to call repeatedly. Does not require fresh research.
+        """
         now_ist = current_time.astimezone(IST) if current_time else datetime.datetime.now(IST)
         active_date = session_date or now_ist.date()
 
-        logger.info("--- Starting Intraday Evaluation Cycle (date=%s, time=%s IST) ---", active_date, now_ist.strftime("%H:%M:%S"))
+        logger.info(
+            "--- Starting Intraday Evaluation Cycle (date=%s, time=%s IST, close_only=%s) ---",
+            active_date, now_ist.strftime("%H:%M:%S"), close_only,
+        )
 
         cycle_results = {
             "evaluated": 0,
@@ -266,7 +276,19 @@ class IntradayWorker:
                         self.execution_adapter.revert_position_to_open(c_pos.position_id)
                         cycle_results["closed_positions"] -= 1
 
-        # 2. Check research snapshot for new trade entries (strictly scoped to active_date)
+        # 2. Close-only mode: skip all new entry logic, return after exits
+        if close_only:
+            logger.info("[close_only] Close-only mode active — skipping research gating and new entries.")
+            cycle_results["status"] = "CLOSE_ONLY"
+            cycle_results["reason"] = "CLOSE_ONLY_MODE"
+            account = self.execution_adapter.get_account_state()
+            logger.info(
+                "Cycle finished (close_only). Account equity=%.2f cash=%.2f positions=%d",
+                account.total_equity, account.cash_balance, len(self.execution_adapter.get_open_positions()),
+            )
+            return cycle_results
+
+        # 3. Check research snapshot for new trade entries (strictly scoped to active_date)
         snapshot: ResearchSnapshot | None = None
         try:
             snapshot = (
@@ -346,28 +368,34 @@ class IntradayWorker:
             cycle_results["reason"] = "EMPTY_WATCHLIST"
             return cycle_results
 
-        logger.info("Evaluation candidates (%d): %s", len(allowed_symbols), allowed_symbols)
+        logger.info("[pipeline] Watchlist loaded: %d symbols → %s", len(allowed_symbols), allowed_symbols)
         cycle_results["evaluated"] = len(allowed_symbols)
 
-        # 3. Window for 5-minute candles
+        # 4. Window for 5-minute candles
         session_start = datetime.datetime.combine(active_date, datetime.time(9, 15), tzinfo=IST)
         session_end = datetime.datetime.combine(active_date, datetime.time(15, 30), tzinfo=IST)
 
-        # 4. Evaluate candidates for entries
+        skipped_idempotency = 0
+        skipped_no_signal = 0
+        skipped_risk_rejected = 0
+
+        # 5. Evaluate candidates for entries
         for symbol in allowed_symbols:
             # Idempotency check: in-memory cache OR Supabase-backed persistent check
             if symbol in self.traded_symbols_today:
-                logger.debug("Symbol %s already traded today (in-memory). Skipping for idempotency.", symbol)
+                logger.debug("[pipeline] %s skipped — already traded today (in-memory cache).", symbol)
+                skipped_idempotency += 1
                 continue
 
             if self.conn and self.account_id:
                 try:
                     if is_symbol_traded_today(self.conn, self.account_id, symbol, active_date):
-                        logger.info("Symbol %s already traded today in Supabase. Skipping for idempotency.", symbol)
+                        logger.info("[pipeline] %s skipped — already traded today (Supabase DB).", symbol)
                         self.traded_symbols_today.add(symbol)
+                        skipped_idempotency += 1
                         continue
                 except Exception as e:
-                    logger.warning("Could not query Supabase idempotency for %s: %s", symbol, e)
+                    logger.warning("[pipeline] %s — Supabase idempotency query failed: %s", symbol, e)
 
             # Check persistent candle processing state
             last_ts = None
@@ -375,7 +403,7 @@ class IntradayWorker:
                 try:
                     last_ts = get_last_processed_candle_ts(self.conn, symbol, active_date)
                 except Exception as e:
-                    logger.warning("Could not query last candle ts for %s: %s", symbol, e)
+                    logger.warning("[pipeline] %s — last candle ts query failed: %s", symbol, e)
 
             try:
                 signal, order = self.engine.process_symbol(
@@ -386,14 +414,25 @@ class IntradayWorker:
                     last_processed_ts=last_ts,
                     current_execution_time=current_time,
                 )
+
                 if signal:
                     cycle_results["signals"] += 1
-                    logger.info("Signal generated for %s: %s @ %.2f", symbol, signal.direction.value, signal.entry_price)
+                    logger.info(
+                        "[pipeline] Signal generated for %s: %s @ %.2f SL=%.2f TP=%.2f RRR=%.1f",
+                        symbol, signal.direction.value, signal.entry_price,
+                        signal.stop_loss, signal.target_price, signal.planned_rrr,
+                    )
+                else:
+                    skipped_no_signal += 1
+                    logger.info("[pipeline] %s — no signal from strategy (no qualifying candle).", symbol)
 
                 if order:
                     cycle_results["orders"] += 1
                     self.traded_symbols_today.add(symbol)
-                    logger.info("Order executed for %s: qty=%d @ %.2f status=%s", symbol, order.quantity, order.price, order.status.value)
+                    logger.info(
+                        "[pipeline] Order executed for %s: qty=%d @ %.2f status=%s",
+                        symbol, order.quantity, order.price, order.status.value,
+                    )
 
                     # Persist atomic trade reservation and trade cycle to Supabase.
                     # Durable candle idempotency: mark_candle_processed is called ONLY after
@@ -443,6 +482,11 @@ class IntradayWorker:
                         except Exception as e:
                             logger.error("Failed to persist trade cycle to Supabase: %s", e)
 
+                elif signal:
+                    # Signal generated but no order means risk engine rejected it
+                    skipped_risk_rejected += 1
+                    logger.info("[pipeline] %s — signal rejected by risk engine (no order created).", symbol)
+
                 # Persist candle checkpoint
                 if self.conn and signal:
                     try:
@@ -457,10 +501,20 @@ class IntradayWorker:
                         logger.warning("Failed to save last candle ts for %s: %s", symbol, e)
 
             except Exception as e:
-                logger.error("Error evaluating symbol %s: %s", symbol, e)
+                logger.error("[pipeline] Error evaluating symbol %s: %s", symbol, e)
+
+        # Pipeline summary
+        logger.info(
+            "[pipeline] Summary — evaluated=%d signals=%d orders=%d "
+            "skipped_idempotency=%d skipped_no_signal=%d skipped_risk_rejected=%d",
+            len(allowed_symbols), cycle_results["signals"], cycle_results["orders"],
+            skipped_idempotency, skipped_no_signal, skipped_risk_rejected,
+        )
         account = self.execution_adapter.get_account_state()
-        logger.info("Cycle finished. Account equity=%.2f cash=%.2f positions=%d",
-                    account.total_equity, account.cash_balance, len(self.execution_adapter.get_open_positions()))
+        logger.info(
+            "Cycle finished. Account equity=%.2f cash=%.2f positions=%d",
+            account.total_equity, account.cash_balance, len(self.execution_adapter.get_open_positions()),
+        )
         return cycle_results
 
 
@@ -470,6 +524,11 @@ def main():
     parser.add_argument("--loop", action="store_true", help="Run continuously with 5-minute sleep intervals")
     parser.add_argument("--use-mock", action="store_true", help="Use MockMarketDataProvider instead of Angel One")
     parser.add_argument("--force-session", action="store_true", help="Bypass market-hours check (for testing)")
+    parser.add_argument(
+        "--close-only",
+        action="store_true",
+        help="Close existing open positions only. Never opens new entries. Safe to call repeatedly.",
+    )
     args = parser.parse_args()
 
     worker = IntradayWorker(mode=TradingMode.PAPER, use_mock=args.use_mock)
@@ -477,6 +536,14 @@ def main():
     if args.run_once:
         now = datetime.datetime.now(IST)
         is_open, msg = worker.get_market_session_status(now)
+
+        # --close-only: always run (closes regardless of session status), never enters new positions
+        if args.close_only:
+            logger.info("[close_only] Bypassing session check for close-only emergency square-off. Session: %s", msg)
+            results = worker.run_cycle(close_only=True)
+            logger.info("Run-once (close-only) results: %s", results)
+            sys.exit(0)
+
         if not is_open and not args.force_session:
             logger.info("Session check: %s. Exiting cleanly.", msg)
             sys.exit(0)

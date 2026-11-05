@@ -65,10 +65,30 @@ jobs:
           TRADING_MODE: 'paper'
           LIVE_TRADING_ENABLED: 'false'
         run: |
+          SCHEDULED_TIME="${{ github.event.schedule }}"
+          ACTUAL_UTC=$(date -u +"%Y-%m-%dT%H:%M:%S UTC")
+          ACTUAL_IST=$(TZ="Asia/Kolkata" date +"%Y-%m-%dT%H:%M:%S IST")
+          echo "[worker] Scheduled cron  : '${SCHEDULED_TIME}'"
+          echo "[worker] Actual UTC time : ${ACTUAL_UTC}"
+          echo "[worker] Actual IST time : ${ACTUAL_IST}"
+
+          # Guard: if delayed past 14:45 IST (09:15 UTC) entry cutoff, skip new entries
+          HOUR=$(date -u +%H)
+          MIN=$(date -u +%M)
+          TOTAL_MINS=$((HOUR * 60 + MIN))
+          ENTRY_CUTOFF_MINS=$((9 * 60 + 15))  # 09:15 UTC = 14:45 IST (last safe entry)
+          MARKET_CLOSE_MINS=$((10 * 60 + 0))  # 10:00 UTC = 15:30 IST
+
+          if [ "$TOTAL_MINS" -gt "$MARKET_CLOSE_MINS" ]; then
+            echo "[worker] Delayed past market close (UTC ${HOUR}:${MIN} > 10:00). Skipping trading evaluation — stale entry signals not replayed."
+            exit 0
+          fi
+
           EXTRA_FLAGS=""
           if [ "${{ github.event.inputs.force_session }}" = "true" ]; then
             EXTRA_FLAGS="--force-session"
           fi
+          echo "[worker] Running: python -m backend.app.worker --run-once ${EXTRA_FLAGS}"
           python -m backend.app.worker --run-once $EXTRA_FLAGS
 
       # Emergency square-off safety cycle.
@@ -98,8 +118,9 @@ jobs:
           TOTAL_MINS=$((HOUR * 60 + MIN))
           SQUAREOFF_MINS=$((9 * 60 + 45))   # 09:45 UTC = 15:15 IST
           if [ "$TOTAL_MINS" -ge "$SQUAREOFF_MINS" ]; then
-            echo "Post-15:15 IST (UTC ${HOUR}:${MIN}) — running emergency square-off cycle"
-            python -m backend.app.worker --run-once --force-session
+            ACTUAL_IST=$(TZ="Asia/Kolkata" date +"%Y-%m-%dT%H:%M:%S IST")
+            echo "Post-15:15 IST (UTC ${HOUR}:${MIN}, IST ${ACTUAL_IST}) — running emergency square-off (close-only, no new entries)"
+            python -m backend.app.worker --run-once --close-only
           else
             echo "Pre-square-off window (UTC ${HOUR}:${MIN}). Emergency cycle skipped."
           fi
