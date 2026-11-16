@@ -179,16 +179,19 @@ def _build_watchlist(
 class ResearchEngine:
     """Orchestrates all data-source adapters and builds a ResearchSnapshot."""
 
-    def run(self, session_type: str = "pre_market") -> ResearchSnapshot:
+    def run(self, session_type: str = "pre_market", trading_date: str | None = None) -> ResearchSnapshot:
         ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
         now_ist = datetime.datetime.now(ist)
         # When overnight runs in the evening (>= 20:00 IST), its analysis targets the next trading day
-        if session_type == "overnight" and now_ist.hour >= 20:
-            trading_date = (now_ist.date() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-        else:
-            trading_date = now_ist.strftime("%Y-%m-%d")
+        if trading_date is None:
+            # Preserve original behaviour if not supplied
+            if session_type == "overnight" and now_ist.hour >= 20:
+                trading_date = (now_ist.date() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+            else:
+                trading_date = now_ist.strftime("%Y-%m-%d")
 
         is_trading, no_trade_reason = _is_trading_day(trading_date)
+
 
         logger.info("ResearchEngine.run session=%s date=%s tradeable=%s", session_type, trading_date, is_trading)
 

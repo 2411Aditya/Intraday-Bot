@@ -38,8 +38,29 @@ logging.basicConfig(
 logger = logging.getLogger("run_research")
 
 
+def _determine_trading_date(session: str, now: datetime.datetime) -> str:
+    """Return the intended trading date (YYYY-MM-DD) for a given session.
+    For overnight sessions the job is scheduled at 23:00 IST (17:30 UTC).
+    The intended trading day is the next calendar day (Monday‑Friday).
+    If the job runs after midnight but before 06:00 IST we still target the
+    previous night’s session (i.e. the same calendar day as the intended session).
+    """
+    if session != "overnight":
+        return now.strftime("%Y-%m-%d")
+    # If we are running on or after the scheduled time (>=20:00 IST) we target tomorrow.
+    if now.hour >= 20:
+        target = now.date() + datetime.timedelta(days=1)
+        return target.strftime("%Y-%m-%d")
+    # If we are running early after midnight but before 06:00 IST, we assume the
+    # intended session was the previous night, so keep today's date.
+    if now.hour < 6:
+        return now.strftime("%Y-%m-%d")
+    # Otherwise (e.g., early evening before scheduled time) we target today.
+    return now.strftime("%Y-%m-%d")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Automated Market Research Runner")
+    parser = argparse.ArgumentParser(description="Run research job for a specific session")
     parser.add_argument(
         "--session",
         choices=["overnight", "pre_market", "post_market"],
@@ -51,16 +72,32 @@ def main():
         action="store_true",
         help="Force execution even on holidays or weekends",
     )
+    parser.add_argument(
+        "--catchup",
+        action="store_true",
+        help="Run morning catch-up for overnight session using latest available closing data",
+    )
     args = parser.parse_args()
 
     ist = zoneinfo.ZoneInfo("Asia/Kolkata")
     now_ist = datetime.datetime.now(ist)
-    if args.session == "overnight" and now_ist.hour >= 20:
-        trading_date = (now_ist.date() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-    else:
+    # Determine trading date robustly for overnight sessions
+    is_catchup = args.catchup or (args.session == "overnight" and now_ist.hour < 12)
+    if is_catchup:
         trading_date = now_ist.strftime("%Y-%m-%d")
+        logger.info(
+            "[catchup] Overnight morning catch-up triggered at %s IST for trading date %s",
+            now_ist.strftime("%H:%M:%S"), trading_date,
+        )
+    else:
+        trading_date = _determine_trading_date(args.session, now_ist)
 
-    logger.info("Starting research job session=%s trading_date=%s IST=%s", args.session, trading_date, now_ist.isoformat())
+    logger.info(
+        "Starting research job session=%s trading_date=%s IST=%s",
+        args.session,
+        trading_date,
+        now_ist.isoformat(),
+    )
 
     is_trading, no_trade_reason = _is_trading_day(trading_date)
     if not is_trading and not args.force:
@@ -83,14 +120,25 @@ def main():
             return
 
     engine = ResearchEngine()
-    snapshot = engine.run(session_type=args.session)
+    # Pass determined trading_date to engine if it supports it
+    snapshot = engine.run(session_type=args.session, trading_date=trading_date)
+    if is_catchup:
+        snapshot.trading_date = trading_date
+        snapshot.is_tradeable_session = False
+        snapshot.risk_warnings.append(
+            f"[MORNING CATCH-UP] Overnight macro research collected at {now_ist.strftime('%H:%M:%S')} IST on {trading_date}. "
+            "Informational input for pre-market analysis; cannot authorize trade entries."
+        )
 
     try:
         save_snapshot(snapshot)
-        logger.info("Snapshot successfully saved to Supabase (id=%s, outlook=%s)", snapshot.snapshot_id, snapshot.market_outlook)
+        logger.info(
+            "Snapshot successfully saved to Supabase (id=%s, outlook=%s)",
+            snapshot.snapshot_id,
+            snapshot.market_outlook,
+        )
     except Exception as e:
         logger.error("Failed to persist research snapshot to Supabase: %s", e)
-        # We don't fail the job hard if DB is temporarily unreachable, but log error
         sys.exit(1)
 
     # Print summary
@@ -111,4 +159,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
