@@ -28,8 +28,10 @@ if root_dir not in sys.path:
 
 import argparse
 import datetime
+import json
 import logging
 import os
+import signal
 import time
 import uuid
 import zoneinfo
@@ -72,6 +74,71 @@ logging.basicConfig(
 logger = logging.getLogger("IntradayWorker")
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
+LOCK_FILE = Path(root_dir) / "logs" / "worker.lock"
+
+
+def is_pid_running(pid: int) -> bool:
+    """Check whether a process with the given PID is actively running."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            h = kernel32.OpenProcess(0x1000, False, pid)
+            if h:
+                kernel32.CloseHandle(h)
+                return True
+            return kernel32.GetLastError() == 5
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+
+def acquire_worker_lock(lock_file: Path = LOCK_FILE, mode_desc: str = "run-once") -> tuple[bool, str | None]:
+    """Acquire a local process lock. Stale locks from dead/restarted processes are cleaned up."""
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    if lock_file.exists():
+        try:
+            content = lock_file.read_text(encoding="utf-8").strip()
+            data = json.loads(content) if content.startswith("{") else {}
+            existing_pid = data.get("pid") or (int(content) if content.isdigit() else None)
+            if existing_pid and is_pid_running(existing_pid):
+                return False, f"Worker process PID {existing_pid} ({data.get('mode', 'unknown')}) is currently active."
+            logger.info("Cleaning up stale worker lock file from inactive PID %s.", existing_pid)
+        except Exception as e:
+            logger.warning("Could not parse existing lock file: %s. Re-acquiring lock.", e)
+
+    try:
+        lock_data = {
+            "pid": os.getpid(),
+            "mode": mode_desc,
+            "started_at": datetime.datetime.now(IST).isoformat(),
+        }
+        lock_file.write_text(json.dumps(lock_data), encoding="utf-8")
+        return True, None
+    except Exception as e:
+        logger.warning("Could not write worker lock file: %s", e)
+        return True, None
+
+
+def release_worker_lock(lock_file: Path = LOCK_FILE) -> None:
+    """Release the worker lock if owned by the current process."""
+    if not lock_file.exists():
+        return
+    try:
+        content = lock_file.read_text(encoding="utf-8").strip()
+        data = json.loads(content) if content.startswith("{") else {}
+        existing_pid = data.get("pid") or (int(content) if content.isdigit() else None)
+        if existing_pid == os.getpid():
+            lock_file.unlink(missing_ok=True)
+    except Exception as e:
+        logger.debug("Failed releasing worker lock: %s", e)
 
 
 class IntradayWorker:
@@ -286,6 +353,17 @@ class IntradayWorker:
                 "Cycle finished (close_only). Account equity=%.2f cash=%.2f positions=%d",
                 account.total_equity, account.cash_balance, len(self.execution_adapter.get_open_positions()),
             )
+            if self.conn:
+                try:
+                    save_last_processed_candle_ts(
+                        self.conn,
+                        "SYSTEM",
+                        active_date,
+                        now_ist,
+                        None,
+                    )
+                except Exception as e:
+                    logger.debug("Failed saving close_only heartbeat to Supabase: %s", e)
             return cycle_results
 
         # 3. Check research snapshot for new trade entries (strictly scoped to active_date)
@@ -488,20 +566,34 @@ class IntradayWorker:
                     logger.info("[pipeline] %s — signal rejected by risk engine (no order created).", symbol)
 
                 # Persist candle checkpoint
-                if self.conn and signal:
+                if self.conn:
                     try:
+                        ckpt_ts = signal.timestamp if signal else now_ist
                         save_last_processed_candle_ts(
                             self.conn,
                             symbol,
                             active_date,
-                            signal.timestamp,
+                            ckpt_ts,
                             signal.signal_id if signal else None,
                         )
                     except Exception as e:
-                        logger.warning("Failed to save last candle ts for %s: %s", symbol, e)
+                        logger.warning("Failed to save candle ts for %s: %s", symbol, e)
 
             except Exception as e:
                 logger.error("[pipeline] Error evaluating symbol %s: %s", symbol, e)
+
+        # Record cycle heartbeat to worker_candle_state
+        if self.conn:
+            try:
+                save_last_processed_candle_ts(
+                    self.conn,
+                    "SYSTEM",
+                    active_date,
+                    now_ist,
+                    None,
+                )
+            except Exception as e:
+                logger.debug("Failed saving SYSTEM heartbeat to Supabase: %s", e)
 
         # Pipeline summary
         logger.info(
@@ -531,43 +623,76 @@ def main():
     )
     args = parser.parse_args()
 
-    worker = IntradayWorker(mode=TradingMode.PAPER, use_mock=args.use_mock)
+    # Close-only mode bypasses worker lock so emergency exits are never blocked
+    if not args.close_only:
+        mode_desc = "loop" if args.loop else "run-once"
+        acquired, conflict_reason = acquire_worker_lock(mode_desc=mode_desc)
+        if not acquired:
+            logger.warning("[worker_lock] Duplicate worker prevented: %s. Exiting cleanly.", conflict_reason)
+            sys.exit(0)
 
-    if args.run_once:
-        now = datetime.datetime.now(IST)
-        is_open, msg = worker.get_market_session_status(now)
+    try:
+        worker = IntradayWorker(mode=TradingMode.PAPER, use_mock=args.use_mock)
 
-        # --close-only: always run (closes regardless of session status), never enters new positions
         if args.close_only:
+            now = datetime.datetime.now(IST)
+            is_open, msg = worker.get_market_session_status(now)
             logger.info("[close_only] Bypassing session check for close-only emergency square-off. Session: %s", msg)
             results = worker.run_cycle(close_only=True)
             logger.info("Run-once (close-only) results: %s", results)
             sys.exit(0)
 
-        if not is_open and not args.force_session:
-            logger.info("Session check: %s. Exiting cleanly.", msg)
-            sys.exit(0)
-
-        results = worker.run_cycle()
-        logger.info("Run-once results: %s", results)
-        sys.exit(0)
-
-    elif args.loop:
-        logger.info("Entering continuous loop mode (polling every 5 minutes)...")
-        while True:
+        elif args.run_once:
             now = datetime.datetime.now(IST)
             is_open, msg = worker.get_market_session_status(now)
-            if is_open or args.force_session:
-                try:
-                    worker.run_cycle()
-                except Exception as e:
-                    logger.error("Cycle error: %s", e)
-            else:
-                logger.info("Market closed (%s). Sleeping...", msg)
-            time.sleep(300)
-    else:
-        # Default behavior: run once
-        worker.run_cycle()
+            if not is_open and not args.force_session:
+                logger.info("Session check: %s. Exiting cleanly.", msg)
+                sys.exit(0)
+
+            results = worker.run_cycle()
+            logger.info("Run-once results: %s", results)
+            sys.exit(0)
+
+        elif args.loop:
+            logger.info("Entering continuous loop mode (polling every 5 minutes)...")
+            shutdown_requested = False
+
+            def handle_shutdown(signum, frame):
+                nonlocal shutdown_requested
+                logger.info("Shutdown signal received (%s). Exiting loop gracefully...", signum)
+                shutdown_requested = True
+
+            signal.signal(signal.SIGINT, handle_shutdown)
+            if hasattr(signal, "SIGTERM"):
+                signal.signal(signal.SIGTERM, handle_shutdown)
+
+            while not shutdown_requested:
+                now = datetime.datetime.now(IST)
+                # Check for post-15:30 IST market close to exit loop at end of trading day
+                if now.time() >= datetime.time(15, 30) and not args.force_session:
+                    logger.info("NSE market session has concluded (after 15:30 IST). Gracefully ending loop for today.")
+                    break
+
+                is_open, msg = worker.get_market_session_status(now)
+                if is_open or args.force_session:
+                    try:
+                        worker.run_cycle()
+                    except Exception as e:
+                        logger.error("Cycle error: %s", e)
+                else:
+                    logger.info("Market closed (%s). Sleeping...", msg)
+
+                # Sleep in 1-second slices so shutdown signals respond promptly
+                for _ in range(300):
+                    if shutdown_requested:
+                        break
+                    time.sleep(1)
+        else:
+            # Default behavior: run once
+            worker.run_cycle()
+    finally:
+        if not args.close_only:
+            release_worker_lock()
 
 
 if __name__ == "__main__":
